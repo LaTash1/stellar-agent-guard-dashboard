@@ -103,7 +103,7 @@ Demo mode is strictly opt-in. When neither the environment flag nor the query pa
 ```bash
 npm run typecheck    # tsc --noEmit
 npm run lint         # eslint
-npm test             # unit tests (31/31 passing)
+npm test             # unit tests (175/175 passing)
 npm run build        # Next.js production build
 npm run inspect      # read-only dump of an instance's state
 ```
