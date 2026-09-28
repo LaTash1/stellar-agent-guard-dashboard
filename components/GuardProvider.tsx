@@ -30,7 +30,7 @@ import type { GuardEvent } from "stellar-agent-guard-sdk";
 import { createServer } from "../lib/guard/chain.ts";
 import { readGuardSnapshot, type GuardSnapshot } from "../lib/guard/guardOps.ts";
 import { NETWORK } from "../lib/guard/network.ts";
-import { GuardFeed } from "../lib/guard/telemetry.ts";
+import { GuardFeed, GuardFeedCoordinator, FEED_SWITCH_HISTORY_LEDGERS } from "../lib/guard/telemetry.ts";
 import { createTabSync, type TabSyncEventType } from "../lib/guard/tabSync.ts";
 import {
   KNOWN_INSTANCES,
@@ -152,9 +152,20 @@ export function GuardProvider({ children }: { children: ReactNode }) {
     lastPolledAt: null,
   });
 
-  // The feed instance is kept in a ref so a re-render never resets its cursor —
-  // losing the cursor would silently re-scan and re-deliver events.
-  const feedRef = useRef<GuardFeed | null>(null);
+  // The active feed is reached only through an identity-keyed coordinator, so a
+  // guard switch can never resume the previous guard's cursor onto a different
+  // stream — the coordinator replaces the feed, it does not re-point it. The
+  // ref holds the coordinator itself; losing it on re-render would drop cursors.
+  const feedRef = useRef<GuardFeedCoordinator | null>(null);
+  if (!feedRef.current) {
+    feedRef.current = new GuardFeedCoordinator(
+      (guardId: string) => new GuardFeed(server, guardId),
+    );
+  }
+  // The freshest ledger head this tab has observed from any feed's polls.
+  // Ledgers are chain-global, so a head learned while watching guard A is the
+  // valid priming point for guard B's history window (FEED_SWITCH_HISTORY_LEDGERS).
+  const knownLedgerRef = useRef<number | null>(null);
   const seenRef = useRef<Set<string>>(new Set());
   // The active guard, readable from the (long-lived) sync listener without
   // re-subscribing on every guard change.
@@ -366,11 +377,9 @@ export function GuardProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const startWatching = useCallback(() => {
-    if (!demo && (!feedRef.current || feedRef.current.guard !== guard)) {
-      feedRef.current = new GuardFeed(server, guard);
-    }
+    if (!demo) feedRef.current?.ensure(guard);
     setFeed((current) => ({ ...current, watching: true, error: null }));
-  }, [guard, server, demo]);
+  }, [guard, demo]);
 
   const stopWatching = useCallback(() => {
     setFeed((current) => ({ ...current, watching: false }));
@@ -430,11 +439,22 @@ export function GuardProvider({ children }: { children: ReactNode }) {
 
     let cancelled = false;
     const tick = async () => {
-      const feedRunner = feedRef.current;
-      if (!feedRunner) return;
+      // Identity-check on every tick: if the operator switched guards, the
+      // coordinator has already swapped the feed; this poll belongs to the
+      // guard on screen, never the one the loop was born with. A feed swapped
+      // in mid-watch is primed for recent history so the operator arrives with
+      // context rather than a blank page (see FEED_SWITCH_HISTORY_LEDGERS).
+      const coordinator = feedRef.current;
+      if (!coordinator) return;
+      const feedRunner = coordinator.ensure(guard);
+      const position = feedRunner.position();
+      if (position.cursor === null && position.latestLedger === null && knownLedgerRef.current !== null) {
+        feedRunner.resetFrom(knownLedgerRef.current - FEED_SWITCH_HISTORY_LEDGERS);
+      }
       try {
         const page = await feedRunner.pollOnce();
         if (cancelled) return;
+        knownLedgerRef.current = Math.max(knownLedgerRef.current ?? 0, page.latestLedger);
         pushEvents(page.events);
         setFeed((current) => ({
           ...current,
@@ -457,7 +477,7 @@ export function GuardProvider({ children }: { children: ReactNode }) {
       cancelled = true;
       clearInterval(timer);
     };
-  }, [feed.watching, pushEvents, demo]);
+  }, [feed.watching, pushEvents, demo, guard, server]);
 
   const value: GuardContextValue = {
     server,
