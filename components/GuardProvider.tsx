@@ -30,6 +30,7 @@ import type { GuardEvent } from "stellar-agent-guard-sdk";
 import { createServer } from "../lib/guard/chain.ts";
 import { readGuardSnapshot, type GuardSnapshot } from "../lib/guard/guardOps.ts";
 import { NETWORK } from "../lib/guard/network.ts";
+import { POLLING, jitteredInterval } from "../lib/guard/polling.ts";
 import { GuardFeed } from "../lib/guard/telemetry.ts";
 import { createTabSync, type TabSyncEventType } from "../lib/guard/tabSync.ts";
 import {
@@ -57,8 +58,8 @@ import {
   syntheticDemoEvent,
 } from "../lib/guard/demoFixtures.ts";
 
-const SNAPSHOT_INTERVAL_MS = 15_000;
-const FEED_INTERVAL_MS = 5_000;
+const SNAPSHOT_INTERVAL_MS = jitteredInterval(POLLING.snapshotMs);
+const FEED_INTERVAL_MS = jitteredInterval(POLLING.feedMs);
 
 interface GuardContextValue {
   server: rpc.Server;
@@ -421,7 +422,7 @@ export function GuardProvider({ children }: { children: ReactNode }) {
           error: null,
         }));
       };
-      const demoTimer = setInterval(emit, 4_000);
+      const demoTimer = setInterval(emit, POLLING.demoEventMs);
       return () => {
         demoCancelled = true;
         clearInterval(demoTimer);
