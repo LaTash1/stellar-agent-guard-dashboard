@@ -15,7 +15,7 @@ import { loadInstances } from "../lib/guard/instance.ts";
 import { freezeGuard } from "../lib/guard/guardOps.ts";
 import { NETWORK } from "../lib/guard/network.ts";
 import { useGuard } from "./GuardProvider.tsx";
-import { starLink } from "./bits.tsx";
+import { Skeleton, starLink } from "./bits.tsx";
 import { useRouter } from "next/navigation";
 import { freighterSigner } from "../lib/guard/wallet.ts";
 
@@ -161,15 +161,19 @@ export function FleetTable() {
           </thead>
           <tbody>
             {loading && rows.length === 0 ? (
-              <tr>
-                <td
-                  colSpan={6}
-                  className="tiny muted"
-                  style={{ textAlign: "center", padding: "20px" }}
-                >
-                  Loading fleet data...
-                </td>
-              </tr>
+              /* The initial fleet poll is a pending read, so it reserves the
+                 table's shape with skeleton rows instead of a text line that
+                 collapses when the rows land. Not zeros, not an empty state. */
+              [0, 1, 2].map((row) => (
+                <tr key={row} aria-busy="true" aria-hidden="true">
+                  <td><Skeleton lines={1} /></td>
+                  <td><Skeleton lines={1} /></td>
+                  <td><Skeleton lines={1} /></td>
+                  <td><Skeleton lines={1} /></td>
+                  <td><Skeleton lines={1} /></td>
+                  <td><Skeleton lines={1} /></td>
+                </tr>
+              ))
             ) : filteredAndSorted.length === 0 ? (
               <tr>
                 <td

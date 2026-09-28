@@ -2,7 +2,8 @@
 
 import { deadManRemaining, describePolicy, isDeadManFrozen } from "stellar-agent-guard-sdk";
 import { useGuard } from "./GuardProvider.tsx";
-import { ErrorBlock, Read, Stat, relativeTime, short } from "./bits.tsx";
+import { ErrorBlock, Read, Skeleton, Stat, relativeTime, short } from "./bits.tsx";
+import { INITIAL_GRID_LABELS, skeletonSpecFor } from "../lib/guard/statusReadState.ts";
 import { PHASE1_ARTIFACT, NETWORK } from "../lib/guard/network.ts";
 import { compilePrintReport } from "../lib/guard/printReport.ts";
 import { calculateVelocity } from "../lib/guard/velocity.ts";
@@ -22,8 +23,14 @@ export function StatusPanel() {
 
   const printReport = snapshot ? compilePrintReport(snapshot, NETWORK.name, wallet?.address || "Disconnected") : null;
 
+  // The panel is `aria-busy` exactly while the first read is in flight (no
+  // snapshot yet, no failure yet). A background refresh is NOT busy: the values
+  // on screen are the previous successful read (stale-while-revalidate), so
+  // re-announcing "busy" on every poll would only be noise.
+  const initialLoadPending = snapshot === null && snapshotError === null;
+
   return (
-    <div className="panel">
+    <div className="panel" aria-busy={initialLoadPending}>
       <div className="row" style={{ justifyContent: "space-between" }}>
         <h2 style={{ margin: 0 }}>On-chain state</h2>
 
@@ -42,18 +49,34 @@ export function StatusPanel() {
         <span className="mono">{guard}</span>
       </p>
 
-      {snapshotError && (
+      {snapshotError ? (
         <ErrorBlock
           title="The guard's state could not be read"
           detail={`${snapshotError} — no values are shown, because a failed read is not an empty policy.`}
         />
-      )}
-
-      {!snapshot && !snapshotError && <p className="muted tiny">Reading the chain…</p>}
-
-      {snapshot && (
+      ) : (
         <>
-          <div className="grid" style={{ marginTop: 12 }}>
+          {/* First-paint skeleton, before the first snapshot lands. The grid is
+              shaped like the resolved one — same labels, same value/note slots
+              (via skeletonSpecFor) — so the panel's height does not collapse
+              and jump when the reads resolve. The placeholders carry no values:
+              pending text is skeleton geometry, never a number (no fake zeros). */}
+          {!snapshot && (
+            <div className="grid" style={{ marginTop: 12 }}>
+              {INITIAL_GRID_LABELS.map((label) => (
+                <div className="stat" key={label} aria-hidden="true">
+                  <div className="k">{label}</div>
+                  <div className="v">
+                    <Skeleton lines={skeletonSpecFor(label).lines} />
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {snapshot && (
+            <>
+              <div className="grid" style={{ marginTop: 12 }}>
             <Stat
               label="Admin freeze"
               tone={snapshot.status.ok ? (snapshot.status.value.admin_frozen ? "danger" : "ok") : undefined}
@@ -61,6 +84,7 @@ export function StatusPanel() {
                 <Read
                   result={snapshot.status}
                   label="status()"
+                  pendingLines={1}
                   render={(status) => (status.admin_frozen ? "FROZEN" : "clear")}
                 />
               }
@@ -120,6 +144,7 @@ export function StatusPanel() {
           <Read
             result={snapshot.window}
             label="Window"
+            pendingLines={skeletonSpecFor("Rolling window").lines}
             render={(window) => {
               const policy = snapshot.policy.ok ? snapshot.policy.value : null;
               if (!window || !policy) {
@@ -190,6 +215,7 @@ export function StatusPanel() {
           <Read
             result={snapshot.policy}
             label="policy()"
+            pendingLines={skeletonSpecFor("Policy in force").lines}
             render={(policy) =>
               policy === null ? (
                 <p className="tiny muted">No policy installed — the account is in default-deny.</p>
@@ -226,6 +252,7 @@ export function StatusPanel() {
           <Read
             result={snapshot.identity}
             label="wasm identity"
+            pendingLines={skeletonSpecFor("Artifact identity").lines}
             render={(identity) => (
               <>
                 <div className="grid">
@@ -266,6 +293,8 @@ export function StatusPanel() {
               </>
             )}
           />
+            </>
+          )}
         </>
       )}
 

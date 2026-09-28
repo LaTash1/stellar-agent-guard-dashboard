@@ -3,7 +3,7 @@
 import { describeGuardEvent, explainReason } from "stellar-agent-guard-sdk";
 import type { GuardEvent } from "stellar-agent-guard-sdk";
 import { useGuard } from "./GuardProvider.tsx";
-import { ErrorBlock, relativeTime, short, starLink } from "./bits.tsx";
+import { ErrorBlock, Skeleton, relativeTime, short, starLink } from "./bits.tsx";
 
 /**
  * The live event feed.
@@ -63,23 +63,39 @@ export function TelemetryFeed() {
       {feed.error && <ErrorBlock title="The event feed could not poll" detail={feed.error} />}
 
       {events.length === 0 ? (
-        <p className="tiny muted">
-          {feed.watching
-            ? "No events from this guard yet. Lifecycle events (policy set, frozen, heartbeat) and allowed decisions appear here as they settle."
-            : "Start watching to tail this guard's events."}
-        </p>
+        feed.watching && feed.latestLedger === null ? (
+          /* The initial load: watching has started but the first poll has not
+             returned (no ledger cursor yet). This is a pending read, not an
+             empty result, so it renders as skeleton rows in the same table
+             shape the events will land in — not as an empty-looking message
+             and not as zeros. */
+          <div className="scrolly" aria-busy="true">
+            <table className="events">
+              {feedHead}
+              <tbody aria-hidden="true">
+                {[0, 1, 2].map((row) => (
+                  <tr key={row}>
+                    <td><Skeleton lines={1} /></td>
+                    <td><Skeleton lines={1} /></td>
+                    <td><Skeleton lines={1} /></td>
+                    <td><Skeleton lines={1} /></td>
+                    <td><Skeleton lines={1} /></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <p className="tiny muted">
+            {feed.watching
+              ? "No events from this guard yet. Lifecycle events (policy set, frozen, heartbeat) and allowed decisions appear here as they settle."
+              : "Start watching to tail this guard's events."}
+          </p>
+        )
       ) : (
         <div className="scrolly">
           <table className="events">
-            <thead>
-              <tr>
-                <th>Event</th>
-                <th>Decision</th>
-                <th>Source</th>
-                <th>Ledger</th>
-                <th>Transaction</th>
-              </tr>
-            </thead>
+            {feedHead}
             <tbody>
               {events.map((event, index) => (
                 <tr key={`${event.topic}-${event.transactionHash ?? "-"}-${event.ledger ?? "-"}-${index}`}>
@@ -122,6 +138,18 @@ export function TelemetryFeed() {
     </div>
   );
 }
+
+const feedHead = (
+  <thead>
+    <tr>
+      <th>Event</th>
+      <th>Decision</th>
+      <th>Source</th>
+      <th>Ledger</th>
+      <th>Transaction</th>
+    </tr>
+  </thead>
+);
 
 function labelFor(event: GuardEvent): string {
   switch (event.kind) {
