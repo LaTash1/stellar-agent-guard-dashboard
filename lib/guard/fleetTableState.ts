@@ -19,10 +19,7 @@
  * empties because the recovery paths differ.
  */
 export type FleetTableState =
-  | { kind: "loading" }
-  | { kind: "registry-empty" }
-  | { kind: "filter-empty" }
-  | { kind: "rows" };
+  { kind: "loading" } | { kind: "registry-empty" } | { kind: "filter-empty" } | { kind: "rows" };
 
 export function fleetTableState(input: {
   loading: boolean;
@@ -39,7 +36,10 @@ export function fleetTableState(input: {
 export function fleetEmptyCopy(state: FleetTableState): { title: string; hint: string } | null {
   switch (state.kind) {
     case "loading":
-      return { title: "Loading fleet data…", hint: "Reading each registered guard from the chain." };
+      return {
+        title: "Loading fleet data…",
+        hint: "Reading each registered guard from the chain.",
+      };
     case "registry-empty":
       return {
         title: "No guards in your registry yet",
