@@ -8,7 +8,7 @@ import { PolicyForm } from "../../components/PolicyForm.tsx";
 import { PanicPanel } from "../../components/PanicPanel.tsx";
 import { DeployPanel } from "../../components/DeployPanel.tsx";
 import { TxHistoryTable } from "../../components/TxHistoryTable.tsx";
-import { GuardContext } from "../../components/GuardProvider.tsx";
+import { GuardContext, GuardEventsContext } from "../../components/GuardProvider.tsx";
 import { TX_HISTORY_STORAGE_KEY, type TxHistoryEntry } from "../../lib/guard/txHistory.ts";
 
 installDom();
@@ -59,7 +59,6 @@ const TEST_GUARD = {
   snapshotError: null,
   refreshing: false,
   refresh: async () => {},
-  events: [],
   feed: { watching: false, latestLedger: null, error: null, lastPolledAt: null },
   startWatching: () => {},
   stopWatching: () => {},
@@ -96,7 +95,13 @@ async function renderPanel(element: ReactElement): Promise<Rendered> {
 }
 
 function renderGuarded(panel: ReactElement): ReactElement {
-  return react.createElement(GuardContext.Provider, { value: TEST_GUARD }, panel);
+  // PolicySimulationView reads the live event feed through `useGuardEvents`,
+  // so the events context needs an (empty) value alongside the guard context.
+  return react.createElement(
+    GuardEventsContext.Provider,
+    { value: [] },
+    react.createElement(GuardContext.Provider, { value: TEST_GUARD }, panel),
+  );
 }
 
 /** Run axe-core scoped to WCAG 2.1 A/AA and return human-readable violations. */
@@ -199,11 +204,7 @@ test("the freeze dialog traps keyboard focus and cycles Tab in both directions",
 
     const dialog = rendered.container.querySelector<HTMLElement>('[role="dialog"]');
     assert.ok(dialog);
-    assert.equal(
-      document.activeElement,
-      dialog,
-      "opening the dialog must move focus into it",
-    );
+    assert.equal(document.activeElement, dialog, "opening the dialog must move focus into it");
 
     // Acknowledge so every control in the dialog is enabled, then walk the trap.
     const ack = rendered.container.querySelector<HTMLInputElement>("#ack-freeze");
