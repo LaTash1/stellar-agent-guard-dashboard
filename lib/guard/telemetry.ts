@@ -248,17 +248,17 @@ export interface FeedCoordinatorStats {
  * not A's stale position (the deferred-init race dies here, synchronously, by
  * identity check). Counting is exposed so tests can prove abandonment.
  */
-export class GuardFeedCoordinator {
-  private feed: PolledFeed | null = null;
+export class GuardFeedCoordinator<T extends PolledFeed = PolledFeed> {
+  private feed: T | null = null;
   private readonly stats: FeedCoordinatorStats = { created: 0, abandoned: 0 };
-  private readonly factory: (guard: string) => PolledFeed;
+  private readonly factory: (guard: string) => T;
 
-  constructor(factory: (guard: string) => PolledFeed) {
+  constructor(factory: (guard: string) => T) {
     this.factory = factory;
   }
 
   /** The feed for `guard`: reused when identity matches, replaced when it does not. */
-  ensure(guard: string): PolledFeed {
+  ensure(guard: string): T {
     if (this.feed && this.feed.guard === guard) return this.feed;
     if (this.feed) this.stats.abandoned += 1;
     this.feed = this.factory(guard);
@@ -267,7 +267,7 @@ export class GuardFeedCoordinator {
   }
 
   /** The live feed, if one exists. Callers poll through this, never a cached ref. */
-  current(): PolledFeed | null {
+  current(): T | null {
     return this.feed;
   }
 

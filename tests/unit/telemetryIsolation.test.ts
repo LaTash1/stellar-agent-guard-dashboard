@@ -48,7 +48,12 @@ class ScriptedFeed implements PolledFeed {
     this.pollCalls += 1;
     if (this.cursor !== null) {
       // Cursor carried forward: the stream is caught up.
-      return { events: [], cursor: this.cursor, latestLedger: this.latestLedger! };
+      return {
+        events: [],
+        cursor: this.cursor,
+        latestLedger: this.latestLedger!,
+        oldestLedger: null,
+      };
     }
     if (this.latestLedger !== null) {
       // Ledger-primed re-scan (the switch-priming path): deliver this guard's
@@ -57,13 +62,18 @@ class ScriptedFeed implements PolledFeed {
       this.historyConsumed = true;
       this.cursor = `${this.guard}-cursor-1`;
       this.latestLedger = this.head;
-      return { events: [...this.history], cursor: this.cursor, latestLedger: this.head };
+      return {
+        events: [...this.history],
+        cursor: this.cursor,
+        latestLedger: this.head,
+        oldestLedger: null,
+      };
     }
     // Unpositioned: SDK head default — no history page.
     this.requestedStartLedger = null;
     this.cursor = `${this.guard}-cursor-1`;
     this.latestLedger = this.head;
-    return { events: [], cursor: this.cursor, latestLedger: this.head };
+    return { events: [], cursor: this.cursor, latestLedger: this.head, oldestLedger: null };
   }
 
   position(): { cursor: string | null; latestLedger: number | null } {
@@ -208,14 +218,18 @@ test("(has-history-on-switch) switch priming asks for a bounded recent window", 
 });
 
 test("(filter-namespace) the provider's clear-on-switch also clears dedup memory", async (t) => {
-  await t.test("eventKey dedup is per-guard by construction: a B event never collides with A's", () => {
-    // The filter namespace the issue asks about is enforced by clearing the
-    // feed and dedup memory on switch (GuardProvider's selectGuard), and by
-    // the per-guard contract filter inside the SDK listener. The property that
-    // must hold: the same event on different guards must not dedupe each other.
-    const keyOf = (guard: string, hash: string, ledger: number) => `ledger|${hash}|${guard}|${ledger}`;
-    const aKey = keyOf("A", "tx1", 5);
-    const bKey = keyOf("B", "tx1", 5);
-    assert.notEqual(aKey, bKey, "identical tx on two guards must remain distinct rows");
-  });
+  await t.test(
+    "eventKey dedup is per-guard by construction: a B event never collides with A's",
+    () => {
+      // The filter namespace the issue asks about is enforced by clearing the
+      // feed and dedup memory on switch (GuardProvider's selectGuard), and by
+      // the per-guard contract filter inside the SDK listener. The property that
+      // must hold: the same event on different guards must not dedupe each other.
+      const keyOf = (guard: string, hash: string, ledger: number) =>
+        `ledger|${hash}|${guard}|${ledger}`;
+      const aKey = keyOf("A", "tx1", 5);
+      const bKey = keyOf("B", "tx1", 5);
+      assert.notEqual(aKey, bKey, "identical tx on two guards must remain distinct rows");
+    },
+  );
 });

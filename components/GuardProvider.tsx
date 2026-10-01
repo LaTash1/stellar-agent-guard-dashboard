@@ -31,7 +31,9 @@ import { readGuardSnapshot, type GuardSnapshot } from "../lib/guard/guardOps.ts"
 import { NETWORK } from "../lib/guard/network.ts";
 import { POLLING, jitteredInterval } from "../lib/guard/polling.ts";
 import {
+  FEED_SWITCH_HISTORY_LEDGERS,
   GuardFeed,
+  GuardFeedCoordinator,
   clearStreamRows,
   emptyStreamBuffer,
   historicalBuffer,
@@ -242,9 +244,18 @@ export function GuardProvider({ children }: { children: ReactNode }) {
     lastPolledAt: null,
   });
 
-  // The feed instance is kept in a ref so a re-render never resets its cursor —
-  // losing the cursor would silently re-scan and re-deliver events.
-  const feedRef = useRef<GuardFeed | null>(null);
+  // The active feed is reached only through an identity-keyed coordinator, so a
+  // guard switch can never resume the previous guard's cursor onto a different
+  // stream — the coordinator replaces the feed, it does not re-point it. The
+  // ref holds the coordinator itself; losing it on re-render would drop cursors.
+  const feedRef = useRef<GuardFeedCoordinator<GuardFeed> | null>(null);
+  if (!feedRef.current) {
+    feedRef.current = new GuardFeedCoordinator((guardId: string) => new GuardFeed(server, guardId));
+  }
+  // The freshest ledger head this tab has observed from any feed's polls.
+  // Ledgers are chain-global, so a head learned while watching guard A is the
+  // valid priming point for guard B's history window (FEED_SWITCH_HISTORY_LEDGERS).
+  const knownLedgerRef = useRef<number | null>(null);
   // The active guard, readable from the (long-lived) sync listener without
   // re-subscribing on every guard change.
   const guardRef = useRef(guard);
@@ -608,11 +619,8 @@ export function GuardProvider({ children }: { children: ReactNode }) {
         setRangeLabel(label);
         return;
       }
-      const feedRunner =
-        feedRef.current && feedRef.current.guard === guard
-          ? feedRef.current
-          : new GuardFeed(server, guard);
-      if (feedRef.current !== feedRunner) feedRef.current = feedRunner;
+      const feedRunner = feedRef.current?.ensure(guard);
+      if (!feedRunner) return;
       setFeed((current) => ({ ...current, error: null }));
       try {
         const page = await feedRunner.pollRange(range);
@@ -627,7 +635,7 @@ export function GuardProvider({ children }: { children: ReactNode }) {
         }));
       }
     },
-    [demo, guard, server],
+    [demo, guard],
   );
 
   // ── Operator session auto-lock ───────────────────────────────────────────
@@ -692,7 +700,11 @@ export function GuardProvider({ children }: { children: ReactNode }) {
       if (!coordinator) return;
       const feedRunner = coordinator.ensure(guard);
       const position = feedRunner.position();
-      if (position.cursor === null && position.latestLedger === null && knownLedgerRef.current !== null) {
+      if (
+        position.cursor === null &&
+        position.latestLedger === null &&
+        knownLedgerRef.current !== null
+      ) {
         feedRunner.resetFrom(knownLedgerRef.current - FEED_SWITCH_HISTORY_LEDGERS);
       }
       try {
