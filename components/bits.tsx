@@ -7,6 +7,7 @@ import type { ReactNode } from "react";
 import type { ReadResult } from "../lib/guard/chain.ts";
 import { ENFORCEMENT_SCOPE_STATEMENT } from "../lib/guard/network.ts";
 import { lookupLabel, subscribeAddressBook } from "../lib/guard/addressBook.ts";
+import { CopyButton } from "./CopyButton.tsx";
 import {
   formatRawStroops,
   formatStroopsWithUnit,
@@ -23,7 +24,11 @@ export function Tabs() {
   return (
     <nav className="tabs">
       {tabs.map((tab) => (
-        <Link key={tab.href} href={tab.href} aria-current={pathname === tab.href ? "page" : undefined}>
+        <Link
+          key={tab.href}
+          href={tab.href}
+          aria-current={pathname === tab.href ? "page" : undefined}
+        >
           {tab.label}
         </Link>
       ))}
@@ -88,13 +93,16 @@ export function Stat({
 }: {
   label: string;
   value: ReactNode;
-  note?: ReactNode;
-  tone?: "ok" | "warn" | "danger";
+  note?: ReactNode | undefined;
+  tone?: "ok" | "warn" | "danger" | undefined;
 }) {
   return (
     <div className="stat">
       <div className="k">{label}</div>
-      <div className={`v${tone ? ` ${tone}` : ""}`} style={tone ? { color: `var(--${tone})` } : undefined}>
+      <div
+        className={`v${tone ? ` ${tone}` : ""}`}
+        style={tone ? { color: `var(--${tone})` } : undefined}
+      >
         {value}
       </div>
       {note !== undefined && <div className="n">{note}</div>}
@@ -169,7 +177,10 @@ export function relativeTime(iso: string | null): string {
 export function OutcomeList({
   steps,
 }: {
-  steps: Array<{ label: string; result: { kind: string; hash?: string; ledger?: number | null; detail?: string } }>;
+  steps: Array<{
+    label: string;
+    result: { kind: string; hash?: string; ledger?: number | null; detail?: string };
+  }>;
 }) {
   return (
     <div style={{ marginTop: 8 }}>
@@ -186,7 +197,8 @@ export function OutcomeList({
           <span className="mono">{step.label}</span>
           {step.result.hash && (
             <div className="mono" style={{ marginLeft: 4 }}>
-              tx {starLink(step.result.hash)} ledger {step.result.ledger ?? "-"}
+              tx {starLink(step.result.hash)} ledger {step.result.ledger ?? "-"}{" "}
+              <CopyButton value={step.result.hash} label={`${step.label} transaction hash`} />
             </div>
           )}
           {step.result.detail && <div className="mono muted">{step.result.detail}</div>}
@@ -204,6 +216,22 @@ export function starLink(hash: string): ReactNode {
   );
 }
 
+/**
+ * A transaction hash as an explorer link plus a copy button (issue #33).
+ *
+ * The link is for looking the transaction up; the button is for taking the
+ * exact hash somewhere else — support tickets, other explorers, runbook
+ * records. Both, because each alone loses the other use.
+ */
+export function TxHashCell({ hash }: { hash: string }): ReactNode {
+  return (
+    <span className="copyable">
+      {starLink(hash)}
+      <CopyButton value={hash} label="transaction hash" />
+    </span>
+  );
+}
+
 export interface AmountDisplayProps extends FormatStroopsOptions {
   /** Amount in stroops (BigInt-safe). */
   stroops: bigint | number | string;
@@ -216,14 +244,19 @@ export interface AmountDisplayProps extends FormatStroopsOptions {
  */
 export function AmountDisplay({ stroops, symbol, decimals }: AmountDisplayProps) {
   const [showRaw, setShowRaw] = useState(false);
-  const human = formatStroopsWithUnit(stroops, { symbol, decimals });
+  const human = formatStroopsWithUnit(stroops, {
+    ...(symbol !== undefined ? { symbol } : {}),
+    ...(decimals !== undefined ? { decimals } : {}),
+  });
   const raw = formatRawStroops(stroops);
   return (
     <button
       type="button"
       className="mono"
       onClick={() => setShowRaw((v) => !v)}
-      aria-label={showRaw ? `Raw amount: ${raw}` : `Amount: ${human}. Activate to show raw stroops.`}
+      aria-label={
+        showRaw ? `Raw amount: ${raw}` : `Amount: ${human}. Activate to show raw stroops.`
+      }
       title={showRaw ? "Show human-readable amount" : "Show raw stroops"}
     >
       {showRaw ? raw : human}
