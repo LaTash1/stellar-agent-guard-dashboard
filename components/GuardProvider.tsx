@@ -33,7 +33,6 @@ import {
   GuardFeed,
   clearStreamRows,
   emptyStreamBuffer,
-  eventKey,
   historicalBuffer,
   ingestEvents,
   pauseStream as pauseBuffer,
@@ -42,12 +41,14 @@ import {
   type TelemetryEvent,
 } from "../lib/guard/telemetry.ts";
 import { createTabSync, type TabSyncEventType } from "../lib/guard/tabSync.ts";
+import { announce } from "../lib/guard/useAnnounce.ts";
 import {
   KNOWN_INSTANCES,
   loadInstances,
   rememberInstance,
   type GuardInstance,
 } from "../lib/guard/instance.ts";
+import { readStatus, readPolicy, readWindow, verifyWasmIdentity } from "../lib/guard/chain.ts";
 import { currentAddress, freighterSigner, type ConnectedWallet } from "../lib/guard/wallet.ts";
 import {
   WalletNotInstalledError,
@@ -69,6 +70,7 @@ import {
   type NetworkSwitchOutcome,
 } from "../lib/guard/networkSwitch.ts";
 import { isObserverSession, readSourceFor } from "../lib/guard/observerMode.ts";
+import { memoryWiper } from "../lib/guard/memoryWiper.ts";
 import type { WalletSigner } from "../lib/guard/submit.ts";
 import {
   useIdleTimer,
@@ -86,10 +88,18 @@ import {
   isDemoMode,
   syntheticDemoEvent,
 } from "../lib/guard/demoFixtures.ts";
-import { resolvePreset, validateRange, type RangePreset, type TimeRange } from "../lib/guard/ledgerTime.ts";
+import {
+  resolvePreset,
+  validateRange,
+  type RangePreset,
+  type TimeRange,
+} from "../lib/guard/ledgerTime.ts";
 
 const SNAPSHOT_INTERVAL_MS = 15_000;
 const FEED_INTERVAL_MS = 5_000;
+
+/** The individually-read fields of a guard snapshot (issue #36 retry keys). */
+export type SnapshotField = "status" | "policy" | "window" | "identity";
 
 /** Display labels for the historical-range presets, mirroring `ledgerTime.ts`. */
 const RANGE_PRESET_LABELS: Record<Exclude<RangePreset, "custom">, string> = {
@@ -126,6 +136,10 @@ interface GuardContextValue {
   snapshotError: string | null;
   refreshing: boolean;
   refresh: () => Promise<void>;
+  /** Per-read retry (issue #36): re-invoke ONLY one failed snapshot read. */
+  retryRead: (field: SnapshotField) => Promise<void>;
+  /** The snapshot field currently re-reading, if any. */
+  retryingField: SnapshotField | null;
   feed: {
     watching: boolean;
     latestLedger: number | null;
@@ -205,7 +219,9 @@ export function GuardProvider({ children }: { children: ReactNode }) {
   // The wallet scope is read once per tab: an injected `window.xbull` does not
   // appear mid-session, and re-probing on every render would mean a popup.
   const scope = useMemo(() => readWalletScope(), []);
-  const [providerId, setProviderId] = useState<WalletProviderId | null>(() => loadPreferredProvider());
+  const [providerId, setProviderId] = useState<WalletProviderId | null>(() =>
+    loadPreferredProvider(),
+  );
   const [availableProviders, setAvailableProviders] = useState<WalletProviderId[]>([]);
   const [networkMismatch, setNetworkMismatch] = useState<NetworkMismatch | null>(null);
   // The connector that produced the current session. Kept in a ref because a
@@ -225,6 +241,10 @@ export function GuardProvider({ children }: { children: ReactNode }) {
   const [snapshot, setSnapshot] = useState<GuardSnapshot | null>(null);
   const [snapshotError, setSnapshotError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
+  // Per-read retry state (issue #36): which single field is re-reading. Only
+  // one retry is in flight at a time — the same in-flight discipline the panel
+  // refresh button follows — and a retry never touches the other fields.
+  const [retryingField, setRetryingField] = useState<SnapshotField | null>(null);
   const [buffer, setBuffer] = useState<StreamBuffer>(emptyStreamBuffer);
   const [rangeLabel, setRangeLabel] = useState<string | null>(null);
   const [feed, setFeed] = useState<GuardContextValue["feed"]>({
@@ -266,6 +286,7 @@ export function GuardProvider({ children }: { children: ReactNode }) {
   // `?demo=true` is only visible in the browser, so demo mode is settled here.
   useEffect(() => {
     if (demoFlagFromQuery(window.location.search)) setDemo(true);
+    return memoryWiper.registerBrowserEvents();
   }, []);
 
   // In demo mode the feed is seeded and watching immediately: a visitor should
@@ -274,7 +295,12 @@ export function GuardProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     if (!demo) return;
     setBuffer(ingestEvents(emptyStreamBuffer(), demoEvents(), { dedupe: false }));
-    setFeed((current) => ({ ...current, watching: true, latestLedger: DEMO_BASE_LEDGER, error: null }));
+    setFeed((current) => ({
+      ...current,
+      watching: true,
+      latestLedger: DEMO_BASE_LEDGER,
+      error: null,
+    }));
   }, [demo]);
 
   // Which wallets this browser can serve, probed without prompting so the
@@ -387,6 +413,7 @@ export function GuardProvider({ children }: { children: ReactNode }) {
     setWallet(null);
     setNetworkMismatch(null);
     tabSync.broadcast("WALLET_DISCONNECTED", { guard: guardRef.current });
+    memoryWiper.wipe();
   }, [tabSync]);
 
   const notifyTabs = useCallback(
@@ -452,6 +479,66 @@ export function GuardProvider({ children }: { children: ReactNode }) {
     refreshRef.current = refresh;
   }, [refresh]);
 
+  /**
+   * Re-run exactly one snapshot read (issue #36).
+   *
+   * Discrete reads get discrete retries: retrying `status` must not re-invoke
+   * `policy`, `window` or `identity` — the operator's per-read error report
+   * names one failed read, and the fix re-reads that one. The other fields stay
+   * exactly as they are, including their own failures, so the panel never
+   * blanks a good value because a sibling read failed. Re-entry follows the
+   * render triple: the failed read shows its error block, then a pending
+   * skeleton while the re-read is in flight, then the value or the error again
+   * (with the retry still available — a failing retry is not a dead end).
+   */
+  const retryRead = useCallback(
+    async (field: SnapshotField) => {
+      if (!guard || retryingField !== null) return; // one in flight at a time
+      setRetryingField(field);
+      try {
+        const failure = (error: unknown): { ok: false; error: string } => ({
+          ok: false,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        let next:
+          | GuardSnapshot["status"]
+          | GuardSnapshot["policy"]
+          | GuardSnapshot["window"]
+          | GuardSnapshot["identity"];
+        switch (field) {
+          case "status":
+            next = await readStatus(server, guard, wallet?.address).catch(failure);
+            break;
+          case "policy":
+            next = await readPolicy(server, guard, wallet?.address).catch(failure);
+            break;
+          case "window":
+            next = await readWindow(server, guard).catch(failure);
+            break;
+          case "identity":
+            next = await verifyWasmIdentity(server, guard)
+              .then((value): GuardSnapshot["identity"] => ({ ok: true, value }))
+              .catch(failure);
+            break;
+        }
+        // Merge only this field into the existing snapshot. A snapshot that has
+        // been replaced wholesale (guard switch, full refresh) since the retry
+        // started is left alone: the retry result is for a guard this panel may
+        // no longer be showing.
+        setSnapshot((current) =>
+          current && current.guard === guard ? { ...current, [field]: next } : current,
+        );
+        announce(
+          next.ok ? `${field} read recovered` : `${field} read failed again`,
+          next.ok ? "polite" : "assertive",
+        );
+      } finally {
+        setRetryingField(null);
+      }
+    },
+    [guard, server, wallet?.address, retryingField],
+  );
+
   // React to what the other tabs announce. Nothing crosses the wire as state:
   // `GUARD_CHANGED` carries an address to select, and the freeze/policy events
   // only prompt a re-read of the chain. Form drafts live in the panel's own
@@ -487,7 +574,11 @@ export function GuardProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     void refresh();
     const timer = setInterval(() => void refresh(), SNAPSHOT_INTERVAL_MS);
-    return () => clearInterval(timer);
+    const unregister = memoryWiper.add(() => clearInterval(timer));
+    return () => {
+      clearInterval(timer);
+      unregister();
+    };
   }, [refresh]);
 
   const selectGuard = useCallback(
@@ -582,12 +673,11 @@ export function GuardProvider({ children }: { children: ReactNode }) {
       if (demo) {
         const from = range.fromUnixSecs ?? 0;
         const to = range.toUnixSecs ?? Number.MAX_SAFE_INTEGER;
-        const inRange = demoEvents()
-          .filter((event) => {
-            if (!event.ledgerClosedAt) return false;
-            const closedAt = Math.floor(new Date(event.ledgerClosedAt).getTime() / 1000);
-            return closedAt >= from && closedAt <= to;
-          });
+        const inRange = demoEvents().filter((event) => {
+          if (!event.ledgerClosedAt) return false;
+          const closedAt = Math.floor(new Date(event.ledgerClosedAt).getTime() / 1000);
+          return closedAt >= from && closedAt <= to;
+        });
         setBuffer(historicalBuffer(inRange));
         setRangeLabel(label);
         return;
@@ -657,9 +747,11 @@ export function GuardProvider({ children }: { children: ReactNode }) {
         }));
       };
       const demoTimer = setInterval(emit, 4_000);
+      const unregister = memoryWiper.add(() => clearInterval(demoTimer));
       return () => {
         demoCancelled = true;
         clearInterval(demoTimer);
+        unregister();
       };
     }
 
@@ -688,9 +780,14 @@ export function GuardProvider({ children }: { children: ReactNode }) {
     };
     void tick();
     const timer = setInterval(() => void tick(), FEED_INTERVAL_MS);
+    const unregister = memoryWiper.add(() => {
+      cancelled = true;
+      clearInterval(timer);
+    });
     return () => {
       cancelled = true;
       clearInterval(timer);
+      unregister();
     };
   }, [feed.watching, pushEvents, demo]);
 
@@ -698,7 +795,10 @@ export function GuardProvider({ children }: { children: ReactNode }) {
   // these unchanged — does not change the context value's identity.
   const { paused, dropped } = buffer;
   const pendingCount = buffer.pending.length;
-  const stream = useMemo(() => ({ paused, pendingCount, dropped }), [paused, pendingCount, dropped]);
+  const stream = useMemo(
+    () => ({ paused, pendingCount, dropped }),
+    [paused, pendingCount, dropped],
+  );
 
   // Memoised so an `events` batch — the frequent update — cannot change this
   // object's identity and re-render every consumer that has nothing to do with
@@ -725,6 +825,8 @@ export function GuardProvider({ children }: { children: ReactNode }) {
       snapshotError,
       refreshing,
       refresh,
+      retryRead,
+      retryingField,
       feed,
       stream,
       pauseStream,
@@ -763,6 +865,8 @@ export function GuardProvider({ children }: { children: ReactNode }) {
       snapshotError,
       refreshing,
       refresh,
+      retryRead,
+      retryingField,
       feed,
       stream,
       pauseStream,
@@ -827,4 +931,4 @@ export function useGuardEvents(): TelemetryEvent[] {
   return value;
 }
 
-export { eventKey, GuardContext, GuardEventsContext };
+export { GuardContext, GuardEventsContext };
