@@ -29,6 +29,7 @@ import type { rpc } from "@stellar/stellar-sdk";
 import { createServer } from "../lib/guard/chain.ts";
 import { readGuardSnapshot, type GuardSnapshot } from "../lib/guard/guardOps.ts";
 import { NETWORK } from "../lib/guard/network.ts";
+import { POLLING, jitteredInterval } from "../lib/guard/polling.ts";
 import {
   GuardFeed,
   clearStreamRows,
@@ -95,8 +96,8 @@ import {
   type TimeRange,
 } from "../lib/guard/ledgerTime.ts";
 
-const SNAPSHOT_INTERVAL_MS = 15_000;
-const FEED_INTERVAL_MS = 5_000;
+const SNAPSHOT_INTERVAL_MS = jitteredInterval(POLLING.snapshotMs);
+const FEED_INTERVAL_MS = jitteredInterval(POLLING.feedMs);
 
 /** The individually-read fields of a guard snapshot (issue #36 retry keys). */
 export type SnapshotField = "status" | "policy" | "window" | "identity";
@@ -746,7 +747,7 @@ export function GuardProvider({ children }: { children: ReactNode }) {
           error: null,
         }));
       };
-      const demoTimer = setInterval(emit, 4_000);
+      const demoTimer = setInterval(emit, POLLING.demoEventMs);
       const unregister = memoryWiper.add(() => clearInterval(demoTimer));
       return () => {
         demoCancelled = true;
