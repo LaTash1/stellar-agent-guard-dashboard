@@ -602,7 +602,7 @@ export function PolicyForm() {
         </div>
       )}
 
-      <div className="row" style={{ marginTop: 14 }}>
+      <div className="form-actions row" style={{ marginTop: 14 }}>
         <button
           disabled={installControl.disabled}
           title={installControl.title}
