@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { formatStroopsWithUnit } from "../lib/guard/formatters.ts";
+import { POLLING, jitteredInterval } from "../lib/guard/polling.ts";
 import {
   pollFleet,
   filterFleet,
@@ -22,10 +23,10 @@ import { freighterSigner } from "../lib/guard/wallet.ts";
 export function FleetTable() {
   const { wallet, server } = useGuard();
   const router = useRouter();
-  
+
   const [rows, setRows] = useState<FleetRow[]>([]);
   const [loading, setLoading] = useState(true);
-  
+
   const [search, setSearch] = useState("");
   const [networkFilter, setNetworkFilter] = useState<string | null>(null);
   const [statusFilter, setStatusFilter] = useState<DerivedStatus | null>(null);
@@ -46,9 +47,9 @@ export function FleetTable() {
         setLoading(false);
       }
     };
-    
+
     fetchFleet();
-    const interval = setInterval(fetchFleet, 5000);
+    const interval = setInterval(fetchFleet, jitteredInterval(POLLING.fleetMs));
     return () => {
       mounted = false;
       clearInterval(interval);
@@ -107,7 +108,7 @@ export function FleetTable() {
             placeholder="Search by name or address..."
           />
         </label>
-        
+
         <div className="row" style={{ flex: 3 }}>
           <label className="field" style={{ marginBottom: 0, flex: 1 }}>
             <span className="lbl">Network</span>
@@ -123,9 +124,7 @@ export function FleetTable() {
             <span className="lbl">Status</span>
             <select
               value={statusFilter || ""}
-              onChange={(e) =>
-                setStatusFilter((e.target.value as DerivedStatus) || null)
-              }
+              onChange={(e) => setStatusFilter((e.target.value as DerivedStatus) || null)}
             >
               <option value="">All Statuses</option>
               <option value="Active">Active</option>
@@ -187,19 +186,13 @@ export function FleetTable() {
                     <div>
                       <strong>{row.contact.label}</strong>
                     </div>
-                    <div className="mono tiny">
-                      {starLink(row.contact.address)}
-                    </div>
+                    <div className="mono tiny">{starLink(row.contact.address)}</div>
                   </td>
                   <td className="tiny">{row.network}</td>
                   <td>{renderStatus(row.derivedStatus)}</td>
+                  <td className="mono tiny">{formatStroopsWithUnit(row.spend24h)}</td>
                   <td className="mono tiny">
-                    {formatStroopsWithUnit(row.spend24h)}
-                  </td>
-                  <td className="mono tiny">
-                    {row.dmsCountdownSecs !== null
-                      ? `${row.dmsCountdownSecs}s`
-                      : "—"}
+                    {row.dmsCountdownSecs !== null ? `${row.dmsCountdownSecs}s` : "—"}
                   </td>
                   <td>
                     <div className="row" style={{ gap: "8px" }}>
