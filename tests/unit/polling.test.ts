@@ -41,9 +41,18 @@ test("jitteredInterval", async (t) => {
 
   await t.test("pinning the rng produces the expected delay", () => {
     // rng() === 0 → factor 0.8 (floor); rng() === 0.5 → factor 0.9.
-    assert.equal(jitteredInterval(10_000, "full", () => 0), 8_000);
-    assert.equal(jitteredInterval(10_000, "full", () => 0.5), 9_000);
-    assert.equal(jitteredInterval(5_000, "full", () => 0.25), 4_250);
+    assert.equal(
+      jitteredInterval(10_000, "full", () => 0),
+      8_000,
+    );
+    assert.equal(
+      jitteredInterval(10_000, "full", () => 0.5),
+      9_000,
+    );
+    assert.equal(
+      jitteredInterval(5_000, "full", () => 0.25),
+      4_250,
+    );
   });
 
   await t.test("spreads consecutive pollers across the jitter band", () => {
@@ -62,7 +71,10 @@ test("jitteredInterval", async (t) => {
   await t.test("'none' mode returns the interval unchanged (deterministic)", () => {
     assert.equal(jitteredInterval(10_000, "none"), 10_000);
     assert.equal(jitteredInterval(5_000, "none"), 5_000);
-    assert.equal(jitteredInterval(10_000, "none", () => 0.99), 10_000);
+    assert.equal(
+      jitteredInterval(10_000, "none", () => 0.99),
+      10_000,
+    );
   });
 
   await t.test("defaults to full jitter with the platform rng", () => {
