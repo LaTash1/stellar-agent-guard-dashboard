@@ -1,15 +1,20 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { before, test } from "node:test";
-import type { ReactElement } from "react";
+import type { ReactElement, ContextType } from "react";
 import type axeCore from "axe-core";
 import { installDom, loadReact, sleep, type Act } from "./domHarness.ts";
 import { PolicyForm } from "../../components/PolicyForm.tsx";
 import { PanicPanel } from "../../components/PanicPanel.tsx";
 import { DeployPanel } from "../../components/DeployPanel.tsx";
+import { StatusPanel } from "../../components/StatusPanel.tsx";
 import { TxHistoryTable } from "../../components/TxHistoryTable.tsx";
+import { TelemetryFeed } from "../../components/TelemetryFeed.tsx";
 import { GuardContext, GuardEventsContext } from "../../components/GuardProvider.tsx";
 import { TX_HISTORY_STORAGE_KEY, type TxHistoryEntry } from "../../lib/guard/txHistory.ts";
+import type { GuardSnapshot } from "../../lib/guard/guardOps.ts";
+
+type GuardEventsContextValue = NonNullable<ContextType<typeof GuardEventsContext>>;
 
 installDom();
 
@@ -62,8 +67,13 @@ const TEST_GUARD = {
   feed: { watching: false, latestLedger: null, error: null, lastPolledAt: null },
   startWatching: () => {},
   stopWatching: () => {},
+  stream: { paused: false, pendingCount: 0, dropped: 0 },
+  pauseStream: () => {},
+  resumeStream: () => {},
   clearEvents: () => {},
   pushEvents: () => {},
+  queryRange: async () => {},
+  rangeLabel: null,
 } as any;
 
 interface Rendered {
@@ -168,6 +178,115 @@ test("the freeze confirmation dialog passes axe-core while open", async () => {
 
     const violations = await axeViolations(rendered.container);
     assert.deepEqual(violations, [], "the open dialog must pass axe-core");
+  } finally {
+    await rendered.unmount();
+  }
+});
+
+test("StatusPanel passes axe-core with the default-deny banner showing", async () => {
+  // The banner is the loudest thing this interface ever renders, so it is
+  // scanned in the state that makes it appear (issue #25).
+  const noPolicy: GuardSnapshot = {
+    guard: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    fetchedAt: "2026-09-25T10:00:00.000Z",
+    status: {
+      ok: true,
+      value: {
+        has_policy: false,
+        admin_frozen: false,
+        heartbeat_expired: false,
+        last_heartbeat: 1_700_000_000n,
+        now: 1_700_000_060n,
+      },
+    },
+    policy: { ok: true, value: null },
+    window: { ok: true, value: null },
+    identity: {
+      ok: true,
+      value: { reportedWasmHash: null, fetchedSha256: "abc123", bytes: 39673, match: false },
+    },
+  };
+  const context = { ...TEST_GUARD, snapshot: noPolicy };
+  const rendered = await renderPanel(
+    react.createElement(
+      GuardContext.Provider,
+      { value: context },
+      react.createElement(StatusPanel),
+    ),
+  );
+  try {
+    assert.ok(
+      rendered.container.querySelector("[data-tier]"),
+      "the scan must have covered a render where the banner is actually present",
+    );
+    const violations = await axeViolations(rendered.container);
+    assert.deepEqual(violations, [], "the default-deny banner must pass axe-core");
+  } finally {
+    await rendered.unmount();
+  }
+});
+
+test("TelemetryFeed passes axe-core with severity tiers on every row kind", async () => {
+  // Scanned populated, not empty: a blocked, an allowed, and a lifecycle row
+  // each in the DOM, so the tier markup is what gets audited (issue #26).
+  const events: unknown[] = [
+    {
+      kind: "auth_checked",
+      topic: "event_auth_checked",
+      source: "diagnostic",
+      contractId: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      ledger: null,
+      ledgerClosedAt: null,
+      transactionHash: null,
+      decision: { result: "blocked", reason: "per_tx_cap_exceeded" },
+      data: {},
+    },
+    {
+      kind: "auth_checked",
+      topic: "event_auth_checked",
+      source: "ledger",
+      contractId: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      ledger: 1_000,
+      ledgerClosedAt: "2026-09-25T10:00:00.000Z",
+      transactionHash: "b".repeat(64),
+      decision: { result: "allowed", reason: null },
+      data: {},
+    },
+    {
+      kind: "heartbeat",
+      topic: "event_heartbeat",
+      source: "ledger",
+      contractId: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      ledger: 1_000,
+      ledgerClosedAt: "2026-09-25T10:00:00.000Z",
+      transactionHash: null,
+      decision: null,
+      data: { at: 1_700_000_000 },
+    },
+  ];
+  const context = { ...TEST_GUARD, events, feed: { ...TEST_GUARD.feed, watching: true } };
+  const rendered = await renderPanel(
+    react.createElement(
+      GuardContext.Provider,
+      { value: context },
+      // TelemetryFeed reads its rows through `useGuardEvents`, which is the
+      // second context — the live rows are split from the guard session on
+      // purpose (see `GuardEventsContext`).
+      react.createElement(
+        GuardEventsContext.Provider,
+        { value: events as GuardEventsContextValue },
+        react.createElement(TelemetryFeed),
+      ),
+    ),
+  );
+  try {
+    assert.equal(
+      rendered.container.querySelectorAll("table.events tbody tr").length,
+      3,
+      "the scan must cover a populated feed",
+    );
+    const violations = await axeViolations(rendered.container);
+    assert.deepEqual(violations, [], "the tiered feed must pass axe-core");
   } finally {
     await rendered.unmount();
   }
