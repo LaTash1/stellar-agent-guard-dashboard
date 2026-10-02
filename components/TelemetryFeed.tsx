@@ -3,11 +3,11 @@
 import { memo, useState } from "react";
 import { describeGuardEvent, explainReason, GUARD_EVENT_TOPICS } from "stellar-agent-guard-sdk";
 import type { GuardEvent } from "stellar-agent-guard-sdk";
-import { STREAM_BUFFER_LIMIT } from "../lib/guard/telemetry.ts";
+import { STREAM_BUFFER_LIMIT, type TelemetryEvent } from "../lib/guard/telemetry.ts";
 import { useGuard, useGuardEvents } from "./GuardProvider.tsx";
 import { TelemetryAlerts } from "./TelemetryAlerts.tsx";
 import { TelemetryChart } from "./TelemetryChart.tsx";
-import { ErrorBlock, relativeTime, short, starLink, TxHashCell } from "./bits.tsx";
+import { ErrorBlock, TimeAgo, short, starLink, TxHashCell } from "./bits.tsx";
 import { DateRangePicker } from "./DateRangePicker.tsx";
 import type { RangePreset, TimeRange } from "../lib/guard/ledgerTime.ts";
 import {
@@ -28,6 +28,7 @@ import {
   type TelemetryFilter,
   type VerdictFilter,
 } from "../lib/guard/telemetryExport.ts";
+import { severityFor } from "../lib/guard/feedSeverity.ts";
 
 /** Human names for the topic filter's options, keyed by the topic symbol. */
 const TOPIC_LABELS: Record<string, string> = {
@@ -60,7 +61,7 @@ function downloadText(filename: string, content: string, mime: string): void {
 /**
  * The live event feed.
  *
- * Two things are stated on the panel rather than glossed over, because both
+ * Three things are stated on the panel rather than glossed over, because all three
  * change how the feed should be read:
  *
  *   - Soroban RPC has no push stream, so this polls `getEvents` with a cursor and
@@ -70,6 +71,12 @@ function downloadText(filename: string, content: string, mime: string): void {
  *     that this console produced itself, decoded from the enforced simulation's
  *     diagnostics and labelled `diagnostic`. Absence of refusals here does not
  *     mean absence of refusals on chain.
+ *   - Rows are tiered by severity so a block is findable by looking, not by
+ *     reading: the tier is a class and a `data-severity`, and every tier's wording
+ *     is already in the row, so nothing here depends on colour.
+ *
+ * There is deliberately no sound. An operator console runs unattended and muted;
+ * a noise that can only be silenced in the tab that made it is not an alert.
  */
 export function TelemetryFeed() {
   // The feed subscribes to the events context itself: batches re-render this
@@ -323,7 +330,12 @@ export function TelemetryFeed() {
         Tailed from Soroban RPC&apos;s <code>getEvents</code> with a cursor, so no event is
         delivered twice and none is skipped between polls. Soroban has no push stream — the floor on
         latency is the ledger close interval (roughly 5s), not the 5s poll.
-        {feed.lastPolledAt && ` Last poll ${relativeTime(feed.lastPolledAt)}.`}
+        {feed.lastPolledAt && (
+          <>
+            {" "}
+            Last poll <TimeAgo iso={feed.lastPolledAt} suffix=" ago" />.
+          </>
+        )}
       </p>
 
       <div className="notice info">
@@ -362,7 +374,7 @@ export function TelemetryFeed() {
                 <th>Event</th>
                 <th>Decision</th>
                 <th>Source</th>
-                <th>Ledger</th>
+                <th>Time</th>
                 <th>Transaction</th>
               </tr>
             </thead>
@@ -400,10 +412,16 @@ export function TelemetryFeed() {
  * on, so React reconciles against the same uniqueness the feed guarantees: a new
  * event prepending shifts nothing, and no row is ever unmounted and rebuilt
  * merely because rows above it changed.
+ *
+ * Severity rides here, on the row's own attributes, so the tier costs no extra
+ * element and the cells stay exactly as they were — O(1) from fields the decoder
+ * already produced, with no topic or reason string parsed (see `severityFor`).
  */
-const TelemetryRow = memo(function TelemetryRow({ event }: { event: GuardEvent }) {
+const TelemetryRow = memo(function TelemetryRow({ event }: { event: TelemetryEvent }) {
+  const severity = severityFor(event);
+  const iso = event.ledgerClosedAt ?? event.observedAt ?? null;
   return (
-    <tr>
+    <tr className={`severity-${severity}`} data-severity={severity} data-stream={event.source}>
       <td>
         <div>{labelFor(event)}</div>
         <div className="tiny muted mono">{describeGuardEvent(event)}</div>
@@ -427,7 +445,14 @@ const TelemetryRow = memo(function TelemetryRow({ event }: { event: GuardEvent }
           {event.source}
         </span>
       </td>
-      <td className="mono tiny">{event.ledger ?? "—"}</td>
+      <td className="mono tiny">
+        {iso ? <TimeAgo iso={iso} /> : "—"}
+        {event.ledger ? (
+          <div className="muted" style={{ marginTop: 2 }}>
+            L{event.ledger}
+          </div>
+        ) : null}
+      </td>
       <td>
         {event.transactionHash ? (
           <TxHashCell hash={event.transactionHash} />

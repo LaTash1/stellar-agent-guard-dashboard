@@ -125,11 +125,18 @@ npm run inspect      # read-only dump of an instance's state
 
 ### Screens
 
+- **`/` (Console Overview)**: Displays connected wallet, active guard address, current balance, policy parameters summary, dead-man switch countdown, live telemetry event stream, and the emergency panic button. Raises a warning-tier banner whenever the guard reports no policy installed — the default-deny state, where every transaction is blocked until one is configured — with a call to action that carries the current guard into the configurator. An unread `status()` is reported as an error, never as "no policy".
 - **`/` (Console Overview)**: Displays connected wallet, active guard address, current balance, policy parameters summary, dead-man switch countdown, live telemetry event stream, transaction history, multisig approvals, an unsigned-XDR submit panel, and the emergency panic button.
 - **`/configure` (Policy Configurator & Deployment)**:
   - Deploy fresh guard accounts from verified on-chain WASM bytecode.
   - Configure spending policy parameters with real-time validation.
   - Sign and submit `set_policy` transactions.
+  - Show the same default-deny banner while nothing is installed, and disable the revoke action — the state it would produce is already in force.
+
+### Key Components & Actions
+
+- **`DeployPanel`**: Fetches bytecode, verifies SHA-256 hash (`f47919...`), predicts custom account address, prompts Freighter signature, and initializes admin + agent keys.
+- **`PolicyForm`**: Real-time form validation, encoding via SDK `policyToScVal`, Freighter signing, and transaction broadcast. Deep links (`/configure?guard=C…`) adopt the guard named in the URL, so navigating from the console's default-deny banner does not silently show a different account's state.
 - **`/fleet` (Fleet Overview)**: One table of every registered guard instance with its live on-chain state, for operators running more than one guarded agent.
 
 ### Key Components & Actions
@@ -141,6 +148,8 @@ npm run inspect      # read-only dump of an instance's state
   - Submits wallet-signed `freeze()` transaction.
   - Re-reads contract `status()` to verify `admin_frozen = true`.
   - Provides wallet-signed `unfreeze()` to restore normal operations.
+- **`TelemetryFeed`**: Cursor-based polling of `event_auth_checked` topics from Soroban RPC, decoding contract outcomes and reason codes. Each row carries a severity tier — blocked rows are marked from the danger token, diagnostic-stream rows from the warn token, and the committed-vs-diagnostic stream is labelled on every row — so blocks are findable by looking rather than by reading, with the tier always also stated in words. No sound: operator consoles run unattended and muted.
+- **`WalletBar`**: Displays Freighter connection status, address, and network validation.
 - **`TelemetryFeed`**: Cursor-based polling of `event_auth_checked` topics from Soroban RPC, decoding contract outcomes and reason codes.
 - **`WalletBar`**: Wallet connection status, address, network validation, and the Freighter / Albedo / xBull connector picker.
 - **`FleetTable`**: Live per-instance status across every registered guard account.

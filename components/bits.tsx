@@ -56,6 +56,39 @@ export function ScopeNotice({ compact = false }: { compact?: boolean }) {
   );
 }
 
+/**
+ * The warning tier: one prominent banner for a state that is *safe* but not
+ * doing what the operator probably assumes it is doing.
+ *
+ * Established here by the default-deny status pass (issue #25) and shared, so
+ * the telemetry feed's per-row severity (issue #26) and the pending-status
+ * surfaces reuse one set of tokens rather than each inventing a red. `tier`
+ * picks the intensity: `warn` for "working as designed, read this", `danger` for
+ * "frozen/refused, act now" — the same two tiers as `.notice` and `.error`.
+ *
+ * `role="status"` announces it politely rather than interrupting: a state that
+ * is already true when the page loads is context, not an event.
+ */
+export function WarningBanner({
+  tier = "warn",
+  title,
+  children,
+  action,
+}: {
+  tier?: "warn" | "danger";
+  title: string;
+  children?: ReactNode;
+  action?: ReactNode;
+}) {
+  return (
+    <div className={`notice${tier === "danger" ? " danger" : ""}`} data-tier={tier} role="status">
+      <strong>{title}</strong>
+      {children}
+      {action}
+    </div>
+  );
+}
+
 export function ErrorBlock({ title, detail }: { title: string; detail: string }) {
   return (
     <div className="error">
@@ -228,12 +261,27 @@ export function AddressText({
   );
 }
 
-export function relativeTime(iso: string | null): string {
-  if (!iso) return "never";
-  const seconds = Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 1000));
-  if (seconds < 60) return `${seconds}s ago`;
-  if (seconds < 3600) return `${Math.round(seconds / 60)}m ago`;
-  return `${Math.round(seconds / 3600)}h ago`;
+import { formatTimeAgo } from "../lib/guard/time.ts";
+
+export function TimeAgo({ iso, suffix = "" }: { iso: string | null; suffix?: string }) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 5000);
+    return () => clearInterval(id);
+  }, []);
+
+  if (!iso) return <span>never</span>;
+
+  const ts = Math.floor(new Date(iso).getTime() / 1000);
+  const nowSecs = Math.floor(now / 1000);
+  const rel = formatTimeAgo(ts, nowSecs);
+
+  return (
+    <time dateTime={iso} title={iso} className="timeago">
+      {rel}
+      {suffix}
+    </time>
+  );
 }
 
 /**
