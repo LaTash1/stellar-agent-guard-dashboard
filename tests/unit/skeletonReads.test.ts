@@ -126,7 +126,9 @@ async function renderElement(element: ReactElement): Promise<Rendered> {
 }
 
 /** The balance surface's Read element for a given read result (or pending). */
-function balanceRead(result: { ok: true; value: bigint } | { ok: false; error: string } | null): ReactElement {
+function balanceRead(
+  result: { ok: true; value: bigint } | { ok: false; error: string } | null,
+): ReactElement {
   return react.createElement(Read, {
     result,
     label: "balance()",
@@ -141,7 +143,11 @@ test("render triple on the balance surface: pending → skeleton, failed → err
   const pending = await renderElement(balanceRead(null));
   try {
     assert.ok(pending.host.querySelector(".skeleton"), "pending must render a skeleton");
-    assert.equal(pending.host.querySelector(".error"), null, "pending must not render an error block");
+    assert.equal(
+      pending.host.querySelector(".error"),
+      null,
+      "pending must not render an error block",
+    );
     assert.doesNotMatch(pending.host.textContent ?? "", /0/);
   } finally {
     await pending.unmount();
@@ -166,7 +172,11 @@ test("render triple on the balance surface: pending → skeleton, failed → err
   try {
     assert.equal(resolved.host.textContent, "0");
     assert.ok(!resolved.host.querySelector(".skeleton"), "resolved must not render a skeleton");
-    assert.equal(resolved.host.querySelector(".error"), null, "resolved must not render an error block");
+    assert.equal(
+      resolved.host.querySelector(".error"),
+      null,
+      "resolved must not render an error block",
+    );
   } finally {
     await resolved.unmount();
   }
@@ -219,7 +229,10 @@ test("no-flicker refresh: the previous value persists while the re-read is in fl
       "5000000000",
       "an in-flight refresh must not blank or skeleton the previous value",
     );
-    assert.ok(!rendered.host.querySelector(".skeleton"), "no skeleton while a valid previous value is held");
+    assert.ok(
+      !rendered.host.querySelector(".skeleton"),
+      "no skeleton while a valid previous value is held",
+    );
 
     // The re-read settles: the value swaps in place, still no skeleton frame.
     await rendered.rerender(balanceRead(next));
@@ -245,7 +258,11 @@ test("no-flicker refresh, failure branch: a failed re-read unmounts the old valu
     assert.ok(errorBlock, "a failed re-read must replace the old value with an error block");
     assert.match(errorBlock?.textContent ?? "", /ledger timeout/);
     assert.ok(!rendered.host.querySelector(".skeleton"));
-    assert.notEqual(rendered.host.textContent, "5000000000", "the stale value must not survive a failure");
+    assert.notEqual(
+      rendered.host.textContent,
+      "5000000000",
+      "the stale value must not survive a failure",
+    );
   } finally {
     await rendered.unmount();
   }
@@ -284,7 +301,11 @@ test("aria-busy lifecycle: true while the deferred read is in flight, false once
   const rendered = await renderElement(react.createElement(Panel));
   try {
     const panel = rendered.host.querySelector('[data-testid="panel"]');
-    assert.equal(panel?.getAttribute("aria-busy"), "true", "in-flight read must set aria-busy=true");
+    assert.equal(
+      panel?.getAttribute("aria-busy"),
+      "true",
+      "in-flight read must set aria-busy=true",
+    );
     assert.ok(rendered.host.querySelector(".skeleton"), "pending phase shows the skeleton");
     assert.equal(rendered.host.textContent, "", "pending phase shows no value");
 
@@ -293,7 +314,11 @@ test("aria-busy lifecycle: true while the deferred read is in flight, false once
       await sleep(0);
     });
 
-    assert.equal(panel?.getAttribute("aria-busy"), "false", "resolved read must set aria-busy=false");
+    assert.equal(
+      panel?.getAttribute("aria-busy"),
+      "false",
+      "resolved read must set aria-busy=false",
+    );
     assert.ok(!rendered.host.querySelector(".skeleton"), "resolved phase clears the skeleton");
     assert.equal(rendered.host.textContent, "250000000");
   } finally {
@@ -331,7 +356,7 @@ test("class parity: the skeleton primitive shares the value slot's sizing contra
   );
   assert.match(
     css,
-    /@media \(prefers-reduced-motion: reduce\) \{[^@]*?\.skeleton \{ animation: none; \}/,
+    /@media \(prefers-reduced-motion: reduce\) \{[^@]*?\.skeleton \{\s*animation: none;\s*\}/,
     "reduced motion must stop the shimmer without removing the reservation",
   );
 });
@@ -345,9 +370,21 @@ test("skeleton adoption is present on the pending surfaces (grep-verified)", () 
   const fleet = readFileSync("components/FleetTable.tsx", "utf8");
 
   assert.match(bits, /SKELETON_CLASS/, "Read's pending branch must use the skeleton primitive");
-  assert.match(status, /INITIAL_GRID_LABELS\.map/, "the first-paint grid must render skeleton stats");
-  assert.match(status, /aria-busy=\{initialLoadPending\}/, "the panel must carry the aria-busy lifecycle");
-  assert.match(telemetry, /aria-busy="true"/, "the telemetry feed's initial load must be aria-busy");
+  assert.match(
+    status,
+    /INITIAL_GRID_LABELS\.map/,
+    "the first-paint grid must render skeleton stats",
+  );
+  assert.match(
+    status,
+    /aria-busy=\{initialLoadPending\}/,
+    "the panel must carry the aria-busy lifecycle",
+  );
+  assert.match(
+    telemetry,
+    /aria-busy="true"/,
+    "the telemetry feed's initial load must be aria-busy",
+  );
   assert.match(fleet, /aria-busy="true"/, "the fleet table's initial poll must be aria-busy");
   assert.doesNotMatch(fleet, /Loading fleet data\.\.\./, "the plain loading text must be gone");
 });

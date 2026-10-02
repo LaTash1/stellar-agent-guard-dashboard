@@ -781,14 +781,20 @@ code {
 }
 
 @keyframes skeleton-shimmer {
-  from { background-position: 200% 0; }
-  to { background-position: 0% 0; }
+  from {
+    background-position: 200% 0;
+  }
+  to {
+    background-position: 0% 0;
+  }
 }
 
 /* Motion-sensitive users get a static block: the reservation (and therefore
    the no-shift contract) is untouched — only the animation stops. */
 @media (prefers-reduced-motion: reduce) {
-  .skeleton { animation: none; }
+  .skeleton {
+    animation: none;
+  }
 }
 
 .toast-head {
