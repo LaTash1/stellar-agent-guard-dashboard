@@ -50,10 +50,7 @@ export function txVerificationStatus(status: string): TxVerificationStatus | nul
 }
 
 /** A history row can be checked only against the exact passphrase it records. */
-export function txHistoryMatchesNetwork(
-  entry: TxHistoryEntry,
-  networkPassphrase: string,
-): boolean {
+export function txHistoryMatchesNetwork(entry: TxHistoryEntry, networkPassphrase: string): boolean {
   return entry.networkPassphrase === networkPassphrase;
 }
 

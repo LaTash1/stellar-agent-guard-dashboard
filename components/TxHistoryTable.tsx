@@ -74,7 +74,9 @@ export function TxHistoryTable() {
         [entry.hash]: {
           status: nextStatus,
           verifiedAt: new Date().toISOString(),
-          ...(status === null ? { detail: `Unrecognized RPC status: ${String(result.status)}` } : {}),
+          ...(status === null
+            ? { detail: `Unrecognized RPC status: ${String(result.status)}` }
+            : {}),
         },
       }));
       announce(
@@ -220,7 +222,9 @@ export function TxHistoryTable() {
                           disabled={verifications[entry.hash]?.status === "checking"}
                           aria-label={`Verify transaction ${entry.hash} on ${entry.networkName ?? "recorded network"}`}
                         >
-                          {verifications[entry.hash]?.status === "checking" ? "Checking…" : "Verify"}
+                          {verifications[entry.hash]?.status === "checking"
+                            ? "Checking…"
+                            : "Verify"}
                         </button>
                       ) : (
                         <span title="Verification is limited to the exact recorded network passphrase">
@@ -229,15 +233,14 @@ export function TxHistoryTable() {
                       )}
                       {verifications[entry.hash] && (
                         <div style={{ marginTop: 4 }}>
-                          <div>
-                            Chain: {verificationLabel(verifications[entry.hash]!.status)}
-                          </div>
+                          <div>Chain: {verificationLabel(verifications[entry.hash]!.status)}</div>
                           {verifications[entry.hash]!.detail && (
                             <div className="muted">{verifications[entry.hash]!.detail}</div>
                           )}
                           {verifications[entry.hash]!.verifiedAt && (
                             <div className="muted">
-                              Checked {formatTimestamp(verifications[entry.hash]!.verifiedAt!)} via {NETWORK.rpcUrl}
+                              Checked {formatTimestamp(verifications[entry.hash]!.verifiedAt!)} via{" "}
+                              {NETWORK.rpcUrl}
                             </div>
                           )}
                         </div>

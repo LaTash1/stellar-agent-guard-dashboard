@@ -142,7 +142,15 @@ test("legacy history rows load with unknown network provenance", () => {
   const storage = fakeStorage();
   storage.setItem(
     TX_HISTORY_STORAGE_KEY,
-    JSON.stringify([{ hash: "legacy", operation: "freeze", status: "confirmed", feeStroops: null, recordedAt: "2026-09-24T10:00:00.000Z" }]),
+    JSON.stringify([
+      {
+        hash: "legacy",
+        operation: "freeze",
+        status: "confirmed",
+        feeStroops: null,
+        recordedAt: "2026-09-24T10:00:00.000Z",
+      },
+    ]),
   );
   const [loaded] = loadTxHistory(storage);
   assert.equal(loaded?.networkName, null);
@@ -161,7 +169,10 @@ test("verification is limited to the row's recorded network passphrase", () => {
   const local = entry();
   assert.equal(txHistoryMatchesNetwork(local, NETWORK.passphrase), true);
   assert.equal(txHistoryMatchesNetwork(local, "another network"), false);
-  assert.equal(txHistoryMatchesNetwork(entry({ networkPassphrase: null }), NETWORK.passphrase), false);
+  assert.equal(
+    txHistoryMatchesNetwork(entry({ networkPassphrase: null }), NETWORK.passphrase),
+    false,
+  );
 });
 
 test("the table verifies against its selected network without rewriting local history", async () => {
@@ -187,7 +198,9 @@ test("the table verifies against its selected network without rewriting local hi
     );
   });
 
-  const verifyButton = div.querySelector('button[aria-label^="Verify transaction"]') as HTMLButtonElement;
+  const verifyButton = div.querySelector(
+    'button[aria-label^="Verify transaction"]',
+  ) as HTMLButtonElement;
   assert.ok(verifyButton);
   await act(async () => verifyButton.click());
   assert.equal(requestedHash, original.hash);
@@ -204,7 +217,12 @@ test("the table disables live verification for a mismatched recorded network", a
     JSON.stringify([entry({ hash: "other-network", networkPassphrase: "another network" })]),
   );
   let rpcCalls = 0;
-  const server = { getTransaction: async () => { rpcCalls += 1; return { status: "SUCCESS" }; } };
+  const server = {
+    getTransaction: async () => {
+      rpcCalls += 1;
+      return { status: "SUCCESS" };
+    },
+  };
   const div = document.createElement("div");
   document.body.appendChild(div);
   root = createRoot(div);

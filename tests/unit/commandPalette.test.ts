@@ -124,7 +124,10 @@ test("empty results are announced and arrow keys and Escape remain safe", async 
     input.dispatchEvent(new window.Event("input", { bubbles: true }));
   });
 
-  assert.equal(div.querySelector('[role="listbox"]')?.getAttribute("aria-label"), "Command results");
+  assert.equal(
+    div.querySelector('[role="listbox"]')?.getAttribute("aria-label"),
+    "Command results",
+  );
   assert.ok(div.querySelector('[role="listbox"]')?.textContent?.includes("No commands found"));
   assert.equal(input.hasAttribute("aria-activedescendant"), false);
   await act(async () => {

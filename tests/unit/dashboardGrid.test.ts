@@ -212,30 +212,39 @@ test("keyboard move controls use rendered-panel boundaries and reset persisted o
     await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
   });
 
-  const statusMoveUp = div.querySelector('button[aria-label="Move Status panel earlier"]') as HTMLButtonElement;
-  const telemetryMoveDown = div.querySelector('button[aria-label="Move Telemetry panel later"]') as HTMLButtonElement;
+  const statusMoveUp = div.querySelector(
+    'button[aria-label="Move Status panel earlier"]',
+  ) as HTMLButtonElement;
+  const telemetryMoveDown = div.querySelector(
+    'button[aria-label="Move Telemetry panel later"]',
+  ) as HTMLButtonElement;
   assert.equal(statusMoveUp.disabled, true);
   assert.equal(telemetryMoveDown.disabled, true);
 
-  const statusMoveDown = div.querySelector('button[aria-label="Move Status panel later"]') as HTMLButtonElement;
+  const statusMoveDown = div.querySelector(
+    'button[aria-label="Move Status panel later"]',
+  ) as HTMLButtonElement;
   await act(() => statusMoveDown.click());
   assert.ok(div.querySelector("section:nth-child(1) h2")?.textContent?.includes("Telemetry panel"));
   assert.ok(
     pendingAnnouncements().some((item) => item.message === "Status panel moved to position 2 of 2"),
   );
   const stored = JSON.parse(localStorage.getItem(LAYOUT_STORAGE_KEY) ?? "[]") as { id: PanelId }[];
-  assert.deepEqual(stored.map((placement) => placement.id), [
-    "telemetry",
-    "txhistory",
-    "panic",
-    "status",
-    "multisig",
-    "xdr",
-  ]);
+  assert.deepEqual(
+    stored.map((placement) => placement.id),
+    ["telemetry", "txhistory", "panic", "status", "multisig", "xdr"],
+  );
 
-  const resetButton = [...div.querySelectorAll("button")].find((button) => button.textContent === "Reset Layout");
+  const resetButton = [...div.querySelectorAll("button")].find(
+    (button) => button.textContent === "Reset Layout",
+  );
   assert.ok(resetButton);
   await act(() => resetButton.click());
-  const resetOrder = JSON.parse(localStorage.getItem(LAYOUT_STORAGE_KEY) ?? "[]") as { id: PanelId }[];
-  assert.deepEqual(resetOrder.map((placement) => placement.id), [...DEFAULT_LAYOUT]);
+  const resetOrder = JSON.parse(localStorage.getItem(LAYOUT_STORAGE_KEY) ?? "[]") as {
+    id: PanelId;
+  }[];
+  assert.deepEqual(
+    resetOrder.map((placement) => placement.id),
+    [...DEFAULT_LAYOUT],
+  );
 });

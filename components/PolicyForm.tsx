@@ -381,7 +381,12 @@ export function PolicyForm() {
       if (result.kind === "submitted") {
         notifyTabs("POLICY_UPDATED", { payload: { operation: "revoke_policy" } });
       }
-      speakPolicyOutcome("revoke_policy", { kind: "invoked", result }, exportOnly, guard ?? undefined);
+      speakPolicyOutcome(
+        "revoke_policy",
+        { kind: "invoked", result },
+        exportOnly,
+        guard ?? undefined,
+      );
       if (!exportOnly) {
         await refresh();
       }
