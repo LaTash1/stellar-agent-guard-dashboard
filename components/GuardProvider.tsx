@@ -25,13 +25,16 @@ import {
   useState,
   type ReactNode,
 } from "react";
+import { usePathname, useRouter } from "next/navigation";
 import type { rpc } from "@stellar/stellar-sdk";
 import { createServer } from "../lib/guard/chain.ts";
 import { readGuardSnapshot, type GuardSnapshot } from "../lib/guard/guardOps.ts";
 import { NETWORK } from "../lib/guard/network.ts";
 import { POLLING, jitteredInterval } from "../lib/guard/polling.ts";
 import {
+  FEED_SWITCH_HISTORY_LEDGERS,
   GuardFeed,
+  GuardFeedCoordinator,
   clearStreamRows,
   emptyStreamBuffer,
   historicalBuffer,
@@ -41,14 +44,26 @@ import {
   type StreamBuffer,
   type TelemetryEvent,
 } from "../lib/guard/telemetry.ts";
+import { FEED_GUARD_CAP, MultiGuardFeed, type FeedSource } from "../lib/guard/feedSubscriptions.ts";
 import { createTabSync, type TabSyncEventType } from "../lib/guard/tabSync.ts";
+import { resolveGuardFromSearch } from "../lib/guard/deeplink.ts";
+import {
+  decodeUrlState,
+  routeForTab,
+  tabForPathname,
+  writeUrlState,
+} from "../lib/guard/urlState.ts";
 import { announce } from "../lib/guard/useAnnounce.ts";
+import { clearGuardScopedState } from "../lib/guard/guardScoped.ts";
 import {
   KNOWN_INSTANCES,
+  defaultGuard,
   loadInstances,
-  rememberInstance,
+  removeInstance as removeSavedInstance,
+  renameInstance as renameSavedInstance,
   type GuardInstance,
 } from "../lib/guard/instance.ts";
+import { addGuard } from "../lib/guard/registry.ts";
 import { readStatus, readPolicy, readWindow, verifyWasmIdentity } from "../lib/guard/chain.ts";
 import { currentAddress, freighterSigner, type ConnectedWallet } from "../lib/guard/wallet.ts";
 import {
@@ -109,7 +124,7 @@ const RANGE_PRESET_LABELS: Record<Exclude<RangePreset, "custom">, string> = {
   "7d": "last 7 days",
 };
 
-interface GuardContextValue {
+export interface GuardContextValue {
   server: rpc.Server;
   wallet: ConnectedWallet | null;
   walletError: string | null;
@@ -130,9 +145,21 @@ interface GuardContextValue {
   /** Ask the wallet to move to this dashboard's network; null when declined. */
   switchNetwork: () => Promise<NetworkSwitchOutcome | null>;
   instances: GuardInstance[];
+  /** The active guard address. Every read/write derives from this, never a constant. */
   guard: string;
+  /** The active instance (address + network + label), or null if it is not saved. */
+  activeInstance: GuardInstance | null;
   selectGuard: (guard: string) => void;
-  addInstance: (guard: string, label: string) => void;
+  /**
+   * Validate and live-verify an address, then save it and switch to it (#22).
+   * Resolves with `{ ok: false, error }` rather than throwing, so the caller can
+   * render an inline error beside the input.
+   */
+  addInstance: (guard: string, label: string) => Promise<{ ok: boolean; error?: string }>;
+  /** Delete an operator-saved guard, clearing the state scoped to it. */
+  removeInstance: (guard: string) => void;
+  /** Rename a saved guard (a known instance gets a saved override). */
+  renameInstance: (guard: string, label: string) => void;
   snapshot: GuardSnapshot | null;
   snapshotError: string | null;
   refreshing: boolean;
@@ -146,6 +173,12 @@ interface GuardContextValue {
     latestLedger: number | null;
     error: string | null;
     lastPolledAt: string | null;
+    /** The guards currently tailed (up to `FEED_GUARD_CAP`), with their labels. */
+    guards: FeedSource[];
+    /** How many registry entries the cap is excluding right now. */
+    capped: number;
+    /** Labels of the excluded guards, so the cap can be named, not just counted. */
+    cappedLabels: string[];
   };
   startWatching: () => void;
   stopWatching: () => void;
@@ -204,8 +237,19 @@ const GuardContext = createContext<GuardContextValue | null>(null);
  */
 const GuardEventsContext = createContext<TelemetryEvent[] | null>(null);
 
-export function GuardProvider({ children }: { children: ReactNode }) {
-  const server = useMemo(() => createServer(NETWORK.rpcUrl), []);
+export function GuardProvider({
+  children,
+  server: serverOverride,
+}: {
+  children: ReactNode;
+  /**
+   * Test seam: the RPC server the console reads through. Production callers omit
+   * it and get one bound to the build's network; the provider test injects a
+   * controllable server to drive the stale-read race deterministically.
+   */
+  server?: rpc.Server;
+}) {
+  const server = useMemo(() => serverOverride ?? createServer(NETWORK.rpcUrl), [serverOverride]);
   // The cross-tab coordinator. It is transport-agnostic (BroadcastChannel with a
   // localStorage fallback) and inert where neither exists, so the provider never
   // branches on availability. Created once per tab.
@@ -234,10 +278,12 @@ export function GuardProvider({ children }: { children: ReactNode }) {
   );
   const [guard, setGuard] = useState<string>(() => {
     if (typeof window !== "undefined") {
-      const g = new URLSearchParams(window.location.search).get("guard");
-      if (g) return g;
+      // The shared link's guard, validated before it becomes state: a
+      // malformed or unsafe address is rejected here, not adopted (issue #132).
+      const shared = decodeUrlState(window.location.search).guard;
+      if (shared) return shared;
     }
-    return isDemoMode() ? DEMO_GUARD : KNOWN_INSTANCES[0]!.guard;
+    return isDemoMode() ? DEMO_GUARD : defaultGuard();
   });
   const [snapshot, setSnapshot] = useState<GuardSnapshot | null>(null);
   const [snapshotError, setSnapshotError] = useState<string | null>(null);
@@ -253,11 +299,78 @@ export function GuardProvider({ children }: { children: ReactNode }) {
     latestLedger: null,
     error: null,
     lastPolledAt: null,
+    guards: [],
+    capped: 0,
+    cappedLabels: [],
   });
 
-  // The feed instance is kept in a ref so a re-render never resets its cursor —
-  // losing the cursor would silently re-scan and re-deliver events.
-  const feedRef = useRef<GuardFeed | null>(null);
+  /**
+   * The two event resets, declared beside the state they reset.
+   *
+   * `clearEvents` empties the table but keeps the dedupe set, so a poll cannot
+   * re-deliver what the operator just cleared. `resetEvents` drops the set too —
+   * required whenever the *guard* changes, or the new account's events would be
+   * swallowed as already-seen. Both are declared here rather than with the rest
+   * of the feed wiring because the deep-link effect below adopts a different
+   * guard before that wiring is reached.
+   */
+  const clearEvents = useCallback(() => {
+    setBuffer(clearStreamRows);
+    setRangeLabel(null);
+  }, []);
+  const resetEvents = useCallback(() => {
+    setBuffer(emptyStreamBuffer());
+    setRangeLabel(null);
+  }, []);
+
+  // The active feed is reached only through an identity-keyed coordinator, so a
+  // guard switch can never resume the previous guard's cursor onto a different
+  // stream — the coordinator replaces the feed, it does not re-point it. The
+  // ref holds the coordinator itself; losing it on re-render would drop cursors.
+  const feedRef = useRef<GuardFeedCoordinator<GuardFeed> | null>(null);
+  if (!feedRef.current) {
+    feedRef.current = new GuardFeedCoordinator((guardId: string) => new GuardFeed(server, guardId));
+  }
+  // The multi-guard supervisor fans the tail out across the registry (#23): one
+  // listener per tailed guard, capped, reconciled whenever the registry changes.
+  // It is layered *over* the coordinator rather than replacing it, so each guard
+  // still gets an identity-keyed, cursor-preserving feed from the coordinator
+  // while the supervisor owns the set. Both live in refs so a re-render can never
+  // reset a cursor and silently re-deliver events.
+  const multiFeedRef = useRef<MultiGuardFeed | null>(null);
+  // The freshest ledger head this tab has observed from any feed's polls.
+  // Ledgers are chain-global, so a head learned while watching guard A is the
+  // valid priming point for guard B's history window (FEED_SWITCH_HISTORY_LEDGERS).
+  const knownLedgerRef = useRef<number | null>(null);
+
+  /**
+   * Drop every guard-scoped feed cursor at once.
+   *
+   * Both layers must go together: the supervisor holds references to feeds the
+   * coordinator created, so clearing only the coordinator would leave it polling
+   * orphans whose cursors are no longer the ones this tab is allowed to resume.
+   */
+  const dropFeedState = useCallback(() => {
+    multiFeedRef.current?.stopAll();
+    multiFeedRef.current = null;
+    feedRef.current = null;
+  }, []);
+
+  /**
+   * The guards to tail, active guard first.
+   *
+   * The active guard leads so the cap can never exclude the account on screen —
+   * a full registry must not starve the one the operator is looking at.
+   */
+  const feedSources = useMemo<FeedSource[]>(() => {
+    const sources: FeedSource[] = [
+      { guard, label: instances.find((i) => i.guard === guard)?.label ?? "Active account" },
+    ];
+    for (const instance of instances) {
+      if (instance.guard !== guard) sources.push({ guard: instance.guard, label: instance.label });
+    }
+    return sources;
+  }, [guard, instances]);
   // The active guard, readable from the (long-lived) sync listener without
   // re-subscribing on every guard change.
   const guardRef = useRef(guard);
@@ -265,6 +378,13 @@ export function GuardProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     guardRef.current = guard;
   }, [guard]);
+
+  // Monotonic read epoch: bumped whenever the active guard changes. A read that
+  // started under guard A and resolves after the switch to B is dropped instead
+  // of painted, because it belongs to a world the operator has left. This is the
+  // abort/ignore-stale pattern the issue's concurrency test pins; without it the
+  // slower of two overlapping `refresh()` calls wins the `setSnapshot` race.
+  const readEpochRef = useRef(0);
 
   // The coordinator is deliberately never closed by an effect cleanup: React's
   // development StrictMode mount/unmount/mount cycle would close the channel on
@@ -278,6 +398,9 @@ export function GuardProvider({ children }: { children: ReactNode }) {
     // the remembered instances.
     if (demo) {
       setInstances([DEMO_INSTANCE]);
+      // Invalidate any in-flight read: switching worlds must not let the old
+      // guard's status land in the fixture view.
+      readEpochRef.current += 1;
       setGuard(DEMO_GUARD);
       return;
     }
@@ -289,6 +412,81 @@ export function GuardProvider({ children }: { children: ReactNode }) {
     if (demoFlagFromQuery(window.location.search)) setDemo(true);
     return memoryWiper.registerBrowserEvents();
   }, []);
+
+  // Adopt the guard a link named, so a call to action that deep-links into the
+  // configurator does not quietly show a *different* account's state: this page
+  // mounts its own provider, which would otherwise fall back to the first known
+  // instance. An address outside the registry is added to it for the session (not
+  // persisted — a link is not the operator choosing to remember an instance), so
+  // the selector always has an option matching the selection. Demo mode pins the
+  // fixture instance and is left alone.
+  useEffect(() => {
+    if (demo) return;
+    const registry = loadInstances();
+    const requested = resolveGuardFromSearch({
+      search: window.location.search,
+      registry,
+      current: guardRef.current,
+    });
+    if (!requested) return;
+    setInstances(
+      requested.addToRegistry
+        ? [
+            ...registry,
+            {
+              guard: requested.guard,
+              label: `Guard ${requested.guard.slice(0, 6)}…${requested.guard.slice(-4)}`,
+              network: NETWORK.name,
+              addedAt: new Date().toISOString(),
+              provenance: "Opened from a link in this browser.",
+            },
+          ]
+        : registry,
+    );
+    setGuard(requested.guard);
+    setSnapshot(null);
+    setSnapshotError(null);
+    resetEvents();
+  }, [demo, resetEvents]);
+
+  // ── Shareable-view URL state (issue #132) ──────────────────────────────
+  // The address bar mirrors what the console shows — the guard and network
+  // here, the active tab below — through `history.replaceState`, never a
+  // navigation: a guard switch must not reload the page (a reload would drop
+  // the in-memory feed, the connected session and any form draft). Because a
+  // write merges into the current query and re-validates every owned
+  // parameter, it also *cleans* a shared link: a malformed `?guard=` or
+  // `?network=` that decode refused to adopt is dropped from the URL by this
+  // first write, while unrelated parameters (`?demo=true`) pass through.
+  useEffect(() => {
+    writeUrlState({ guard, network: NETWORK.name });
+  }, [guard]);
+
+  // The active tab, in both directions. On the first run a tab the shared URL
+  // already named is *preserved* — it is what the console page's restore reads
+  // — and a screen tab that disagrees with the path wins by navigating to its
+  // route, so `/?tab=fleet` restores the Fleet view. Every later run follows
+  // navigation: whatever route the operator lands on is the active tab.
+  const pathname = usePathname();
+  const router = useRouter();
+  const tabAdopted = useRef(false);
+  useEffect(() => {
+    if (!tabAdopted.current) {
+      tabAdopted.current = true;
+      const shared = decodeUrlState(window.location.search).tab;
+      if (shared !== undefined) {
+        const route = routeForTab(shared);
+        // Panel tabs only mean something on the console; anywhere else the
+        // path's own tab is the honest state.
+        if (route !== null || pathname === "/") {
+          writeUrlState({ tab: shared });
+          if (route !== null && route !== pathname) router.replace(route);
+          return;
+        }
+      }
+    }
+    writeUrlState({ tab: tabForPathname(pathname) });
+  }, [pathname, router]);
 
   // In demo mode the feed is seeded and watching immediately: a visitor should
   // see realistic telemetry without having to click "Start watching" first. The
@@ -450,6 +648,10 @@ export function GuardProvider({ children }: { children: ReactNode }) {
 
   const refresh = useCallback(async () => {
     if (!guard) return;
+    // Capture the epoch this read belongs to. If the operator switches guard
+    // while it is in flight, `readEpochRef` moves on and the result below is
+    // discarded — guard A's status must never paint over guard B's view.
+    const epoch = readEpochRef.current;
     setRefreshing(true);
     try {
       // In demo mode the snapshot is a fixture, so no read (and no failure) is
@@ -460,15 +662,17 @@ export function GuardProvider({ children }: { children: ReactNode }) {
       const next = demo
         ? demoSnapshot()
         : await readGuardSnapshot(server, guard, readSourceFor(wallet));
+      if (epoch !== readEpochRef.current) return;
       setSnapshot(next);
       setSnapshotError(null);
     } catch (error) {
+      if (epoch !== readEpochRef.current) return;
       // A transport failure is not the guard's state: report it as a failure and
       // drop the previous snapshot rather than leaving stale numbers on screen.
       setSnapshot(null);
       setSnapshotError(error instanceof Error ? error.message : String(error));
     } finally {
-      setRefreshing(false);
+      if (epoch === readEpochRef.current) setRefreshing(false);
     }
   }, [guard, server, wallet, demo]);
 
@@ -550,10 +754,14 @@ export function GuardProvider({ children }: { children: ReactNode }) {
         case "GUARD_CHANGED": {
           const next = event.guard;
           if (!next || next === guardRef.current) return;
+          readEpochRef.current += 1;
           setGuard(next);
           setSnapshot(null);
           setSnapshotError(null);
           setBuffer(emptyStreamBuffer());
+          // The feed cursor is guard-scoped: never carry the previous guard's
+          // cursor into the new stream.
+          dropFeedState();
           return;
         }
         case "FREEZE_STATE_CHANGED":
@@ -570,7 +778,7 @@ export function GuardProvider({ children }: { children: ReactNode }) {
           return;
       }
     });
-  }, [tabSync]);
+  }, [tabSync, dropFeedState]);
 
   useEffect(() => {
     void refresh();
@@ -584,26 +792,77 @@ export function GuardProvider({ children }: { children: ReactNode }) {
 
   const selectGuard = useCallback(
     (next: string) => {
+      // Invalidate in-flight reads first: the epoch bump makes the guard switch
+      // atomic with respect to `refresh`, even though the state update is async.
+      readEpochRef.current += 1;
       setGuard(next);
       setSnapshot(null);
+      setSnapshotError(null);
       setBuffer(emptyStreamBuffer());
       setRangeLabel(null);
+      // Drop the (guard-scoped) feed cursor so a switch can never bleed guard A's
+      // events into guard B; the poll effect rebuilds it for the new guard.
+      dropFeedState();
       // Every other tab follows the operator's selection instead of continuing to
       // poll a guard they are no longer looking at.
       tabSync.broadcast("GUARD_CHANGED", { guard: next });
     },
-    [tabSync],
+    [tabSync, dropFeedState],
   );
 
   const addInstance = useCallback(
-    (next: string, label: string) => {
-      rememberInstance(next, label);
+    async (address: string, label: string): Promise<{ ok: boolean; error?: string }> => {
+      if (demo) {
+        return {
+          ok: false,
+          error: "Demo mode pins a single static fixture; adding a guard needs a real network.",
+        };
+      }
+      const result = await addGuard({ server, address, label });
+      if (!result.ok) return { ok: false, error: result.error };
+      readEpochRef.current += 1;
       setInstances(loadInstances());
-      setGuard(next);
+      setGuard(result.instance.guard);
       setSnapshot(null);
-      tabSync.broadcast("GUARD_CHANGED", { guard: next });
+      setSnapshotError(null);
+      dropFeedState();
+      tabSync.broadcast("GUARD_CHANGED", { guard: result.instance.guard });
+      return { ok: true };
     },
-    [tabSync],
+    [server, demo, tabSync, dropFeedState],
+  );
+
+  const removeInstance = useCallback(
+    (target: string) => {
+      const removed = instances.find((instance) => instance.guard === target);
+      const remaining = removeSavedInstance(target);
+      setInstances(remaining);
+      // Cascade: state scoped to the deleted guard (drafts, filters) is removed
+      // too, so re-adding the same address later starts clean rather than
+      // resurrecting work the operator discarded with the guard.
+      clearGuardScopedState(removed?.network ?? NETWORK.name, target);
+      if (target === guard) {
+        const fallback = remaining[0]?.guard ?? defaultGuard();
+        readEpochRef.current += 1;
+        setGuard(fallback);
+        setSnapshot(null);
+        setSnapshotError(null);
+        setBuffer(emptyStreamBuffer());
+        setRangeLabel(null);
+        dropFeedState();
+        tabSync.broadcast("GUARD_CHANGED", { guard: fallback });
+      }
+    },
+    [instances, guard, tabSync, dropFeedState],
+  );
+
+  const renameInstance = useCallback((target: string, label: string) => {
+    setInstances(renameSavedInstance(target, label));
+  }, []);
+
+  const activeInstance = useMemo(
+    () => instances.find((instance) => instance.guard === guard) ?? null,
+    [instances, guard],
   );
 
   const pushEvents = useCallback((incoming: TelemetryEvent[]) => {
@@ -634,25 +893,81 @@ export function GuardProvider({ children }: { children: ReactNode }) {
   }, [pushEvents]);
 
   const startWatching = useCallback(() => {
-    if (!demo && (!feedRef.current || feedRef.current.guard !== guard)) {
-      feedRef.current = new GuardFeed(server, guard);
+    if (!demo) {
+      // One supervisor for the tab's whole tail. `createFeed` defers to the
+      // coordinator so every guard still gets an identity-keyed feed, and
+      // primes a genuinely fresh one so a newly added guard arrives with recent
+      // context instead of a blank page.
+      const coordinator = feedRef.current;
+      if (!multiFeedRef.current && coordinator) {
+        multiFeedRef.current = new MultiGuardFeed({
+          cap: FEED_GUARD_CAP,
+          createFeed: (target: string) => {
+            const runner = coordinator.ensure(target);
+            const position = runner.position();
+            if (
+              position.cursor === null &&
+              position.latestLedger === null &&
+              knownLedgerRef.current !== null
+            ) {
+              runner.resetFrom(knownLedgerRef.current - FEED_SWITCH_HISTORY_LEDGERS);
+            }
+            return runner;
+          },
+        });
+      }
+      const supervisor = multiFeedRef.current;
+      supervisor?.sync(feedSources);
+      const capped = supervisor?.dropped() ?? [];
+      setFeed((current) => ({
+        ...current,
+        watching: true,
+        error: null,
+        guards: supervisor?.guards() ?? [],
+        capped: capped.length,
+        cappedLabels: capped.map((source) => source.label),
+      }));
+      return;
     }
     setFeed((current) => ({ ...current, watching: true, error: null }));
-  }, [guard, server, demo]);
+  }, [feedSources, demo]);
 
   const stopWatching = useCallback(() => {
-    setFeed((current) => ({ ...current, watching: false }));
+    // Release every listener rather than just hiding the table: a stopped
+    // supervisor refuses further polls, so a reconciled-away guard's stream
+    // cannot keep running behind a "not watching" header.
+    multiFeedRef.current?.stopAll();
+    multiFeedRef.current = null;
+    setFeed((current) => ({
+      ...current,
+      watching: false,
+      guards: [],
+      capped: 0,
+      cappedLabels: [],
+    }));
   }, []);
 
-  const clearEvents = useCallback(() => {
-    setBuffer(clearStreamRows);
-    setRangeLabel(null);
-  }, []);
-  /** Drop everything, queued events and history included: a new guard or a locked session. */
-  const resetEvents = useCallback(() => {
-    setBuffer(emptyStreamBuffer());
-    setRangeLabel(null);
-  }, []);
+  // Keep the running listeners aligned with the registry while watching (#23).
+  // This is what starts a listener for a newly added guard and stops one whose
+  // guard was deleted or renamed, without ever exceeding the cap.
+  useEffect(() => {
+    if (demo || !feed.watching) return;
+    const supervisor = multiFeedRef.current;
+    if (!supervisor) return;
+    supervisor.sync(feedSources);
+    const capped = supervisor.dropped();
+    setFeed((current) => ({
+      ...current,
+      guards: supervisor.guards(),
+      capped: capped.length,
+      cappedLabels: capped.map((source) => source.label),
+    }));
+  }, [feedSources, feed.watching, demo]);
+
+  // The supervisor is deliberately never torn down by an effect cleanup: React's
+  // development StrictMode mount/unmount/mount cycle would stop the listeners on
+  // the simulated unmount and leave the tab unable to tail. The provider lives as
+  // long as the document, and the polling effect below clears its own interval.
 
   // ── Historical range queries (#148) ──────────────────────────────────
   // The demo feed never touches RPC, so a demo-mode range query is answered
@@ -683,11 +998,8 @@ export function GuardProvider({ children }: { children: ReactNode }) {
         setRangeLabel(label);
         return;
       }
-      const feedRunner =
-        feedRef.current && feedRef.current.guard === guard
-          ? feedRef.current
-          : new GuardFeed(server, guard);
-      if (feedRef.current !== feedRunner) feedRef.current = feedRunner;
+      const feedRunner = feedRef.current?.ensure(guard);
+      if (!feedRunner) return;
       setFeed((current) => ({ ...current, error: null }));
       try {
         const page = await feedRunner.pollRange(range);
@@ -702,7 +1014,7 @@ export function GuardProvider({ children }: { children: ReactNode }) {
         }));
       }
     },
-    [demo, guard, server],
+    [demo, guard],
   );
 
   // ── Operator session auto-lock ───────────────────────────────────────────
@@ -758,17 +1070,30 @@ export function GuardProvider({ children }: { children: ReactNode }) {
 
     let cancelled = false;
     const tick = async () => {
-      const feedRunner = feedRef.current;
-      if (!feedRunner) return;
+      // Identity-check on every tick: the supervisor holds one listener per tailed
+      // guard, and it is reconciled against the registry rather than pinned to
+      // whichever guard the loop was born with. A feed added mid-watch is primed
+      // for recent history so the operator arrives with context rather than a
+      // blank page (see FEED_SWITCH_HISTORY_LEDGERS).
+      const supervisor = multiFeedRef.current;
+      if (!supervisor) return;
       try {
-        const page = await feedRunner.pollOnce();
+        const page = await supervisor.pollAll();
         if (cancelled) return;
-        pushEvents(page.events);
+        if (page.latestLedger !== null) {
+          knownLedgerRef.current = Math.max(knownLedgerRef.current ?? 0, page.latestLedger);
+        }
+        pushEvents(page.events as TelemetryEvent[]);
+        // One guard failing to poll is reported on its own line and does not
+        // blank the guards that answered. `error` carries the first failure so
+        // the panel still has a headline to show.
+        const failed = page.watch.find((entry) => !entry.ok);
         setFeed((current) => ({
           ...current,
-          latestLedger: page.latestLedger,
+          latestLedger: page.latestLedger ?? current.latestLedger,
           lastPolledAt: new Date().toISOString(),
-          error: null,
+          guards: supervisor.guards(),
+          error: failed ? `${failed.label}: ${failed.error}` : null,
         }));
       } catch (error) {
         if (cancelled) return;
@@ -820,8 +1145,11 @@ export function GuardProvider({ children }: { children: ReactNode }) {
       switchNetwork,
       instances,
       guard,
+      activeInstance,
       selectGuard,
       addInstance,
+      removeInstance,
+      renameInstance,
       snapshot,
       snapshotError,
       refreshing,
@@ -860,8 +1188,11 @@ export function GuardProvider({ children }: { children: ReactNode }) {
       switchNetwork,
       instances,
       guard,
+      activeInstance,
       selectGuard,
       addInstance,
+      removeInstance,
+      renameInstance,
       snapshot,
       snapshotError,
       refreshing,

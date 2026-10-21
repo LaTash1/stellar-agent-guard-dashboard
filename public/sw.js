@@ -15,10 +15,32 @@
  *
  * A stale shell is recoverable — reloading fetches it again. A stale freeze flag
  * is not: during an incident the console must show what the chain says now.
+ *
+ * Updates never replace a running app on their own. This worker deliberately
+ * does not call `skipWaiting()` while installing: a new shell that activated
+ * itself could discard a policy draft or interrupt a wallet approval. It waits,
+ * the page shows a non-blocking notice, and only the page's explicit request
+ * (the `GUARD_SKIP_WAITING` message below) promotes it. See `lib/guard/pwa.ts`.
  */
 
-const CACHE_NAME = "stellar-agent-guard-static-v1";
+/** Must equal `SERVICE_WORKER_SKIP_WAITING_MESSAGE` in `lib/guard/pwa.ts`. */
+const SKIP_WAITING_MESSAGE = "GUARD_SKIP_WAITING";
+
+// Versioned so activation of a new shell drops the previous one's cached assets
+// instead of mixing two builds in one cache.
+const CACHE_NAME = "stellar-agent-guard-static-v3";
 const OFFLINE_URL = "/offline.html";
+
+/*
+ * Set on any response the worker answered from its cache (issue #348).
+ *
+ * A cached shell is indistinguishable from a live one by looking at it, which
+ * is exactly the confusion the console must avoid: the page can read this
+ * header on a navigation or asset response and say that it is showing cached
+ * interface, not current chain state. Chain reads never pass through here, so
+ * they never carry the marker.
+ */
+const CACHED_SHELL_HEADER = "X-Guard-Shell";
 
 /** Everything the shell needs to render without the network. */
 const PRECACHE_URLS = [
@@ -68,14 +90,48 @@ function isCacheable(response) {
   return Boolean(response) && response.status === 200 && (response.type === "basic" || response.type === "default");
 }
 
+/**
+ * A cached response, tagged so the page knows it did not come from the network.
+ *
+ * `Response` headers are immutable, so the body is re-wrapped with a fresh
+ * header set; the status and body are the cached ones, unchanged.
+ */
+function markCached(response) {
+  if (!response) return response;
+  const headers = {};
+  response.headers.forEach((value, key) => {
+    headers[key] = value;
+  });
+  headers[CACHED_SHELL_HEADER] = "cached";
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
 self.addEventListener("install", (event) => {
   event.waitUntil(
     (async () => {
       const cache = await caches.open(CACHE_NAME);
       await cache.addAll(PRECACHE_URLS);
-      await self.skipWaiting();
+      // No `skipWaiting()` here on purpose: the new worker stays in `waiting`
+      // until a page asks for it, so the operator decides when to reload.
     })(),
   );
+});
+
+/*
+ * The one way an update takes over.
+ *
+ * The page posts this only after an explicit reload action, and after warning
+ * the operator if a draft or a pending write would be discarded. A message from
+ * anywhere else is ignored, and nothing about a transaction is persisted or
+ * replayed by activation: this worker only ever serves the static shell.
+ */
+self.addEventListener("message", (event) => {
+  if (!event.data || event.data.type !== SKIP_WAITING_MESSAGE) return;
+  event.waitUntil(self.skipWaiting());
 });
 
 self.addEventListener("activate", (event) => {
@@ -121,8 +177,9 @@ async function handleStatic(event, request) {
 
   if (cached) {
     // Serve the cached copy now and let the refresh settle in the background.
+    // The tag lets the page say the asset is stale rather than current.
     event.waitUntil(refresh);
-    return cached;
+    return markCached(cached);
   }
   const fresh = await refresh;
   return fresh || Response.error();
@@ -135,11 +192,12 @@ async function handleNavigation(event, request) {
     if (isCacheable(response)) await cache.put(request, response.clone());
     return response;
   } catch {
-    return (
+    const cached =
       (await cache.match(request)) ||
       (await cache.match("/")) ||
-      (await cache.match(OFFLINE_URL)) ||
-      Response.error()
-    );
+      (await cache.match(OFFLINE_URL));
+    // An offline navigation is served the cached shell, tagged so the page can
+    // announce that it is offline interface rather than live chain state.
+    return cached ? markCached(cached) : Response.error();
   }
 }

@@ -65,12 +65,32 @@ const config: NextConfig = {
     return config;
   },
   async headers() {
+    const csp = [
+      "default-src 'self'",
+      "base-uri 'self'",
+      "object-src 'none'",
+      "frame-ancestors 'none'",
+      // These pages are statically prerendered, so Next cannot inject a per-request
+      // script nonce (nonces require dynamic rendering). Allowing the framework's
+      // own inline hydration bootstrap is therefore the narrowest `script-src` the
+      // static output can run under; the dashboard loads no third-party scripts and
+      // the policy still forbids string-eval.
+      "script-src 'self' 'unsafe-inline'",
+      "style-src 'self' 'unsafe-inline'",
+      "img-src 'self' data: blob:",
+      "font-src 'self' data:",
+      "connect-src 'self' https://horizon-testnet.stellar.org https://horizon.stellar.org https://soroban-testnet.stellar.org https://soroban-mainnet.stellar.org https://friendbot.stellar.org http://localhost:3000 http://localhost:3001 ws://localhost:3000 ws://localhost:3001",
+      "form-action 'self'",
+      "upgrade-insecure-requests",
+    ].join("; ");
+
     return [
       {
         source: "/(.*)",
         headers: [
+          { key: "Content-Security-Policy", value: csp },
           { key: "X-Content-Type-Options", value: "nosniff" },
-          { key: "Referrer-Policy", value: "no-referrer" },
+          { key: "Referrer-Policy", value: "strict-origin-when-cross-origin" },
           { key: "X-Frame-Options", value: "DENY" },
         ],
       },

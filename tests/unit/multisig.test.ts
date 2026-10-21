@@ -2,17 +2,21 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { Horizon } from "@stellar/stellar-sdk";
 import {
+  THRESHOLD_LABELS,
   approvalPercent,
   approvalSummary,
   evaluateApprovalState,
   pendingSigners,
+  remainingWeightSummary,
   type MultisigSigner,
   type MultisigThresholds,
 } from "../../lib/guard/multisig.ts";
 import {
   defaultSignerLabel,
+  matchEnvelopeSignatures,
   readEnvelopeSignatures,
   signerHint,
+  signerKind,
   unmatchedSignatures,
 } from "../../lib/guard/multisigRead.ts";
 import { Account, Keypair, Networks, Operation, TransactionBuilder } from "@stellar/stellar-sdk";
@@ -200,6 +204,13 @@ test("envelope signatures are read from the XDR and matched to signers by hint",
     unmatchedSignatures(decoded.value, [{ key: keypair.publicKey(), weight: 1, label: "A" }]),
     [],
   );
+
+  // Matching turns the hint back into the account identity; no ambiguity here.
+  const matched = matchEnvelopeSignatures(decoded.value, [
+    { key: keypair.publicKey(), weight: 1, label: "A" },
+  ]);
+  assert.deepEqual(matched.signatures, [{ signer: keypair.publicKey() }]);
+  assert.deepEqual(matched.ambiguousHints, []);
 });
 
 test("a malformed envelope is an error, not a silent empty signature list", () => {
@@ -223,6 +234,11 @@ test("readAccountSigners maps Horizon's record into tracker inputs and reports f
     signers: [
       { key: ADMIN_1, weight: 10, type: "ed25519_public_key" },
       { key: ADMIN_2, weight: 10, type: "ed25519_public_key" },
+      {
+        key: "TBUQNML5TT5ZNFKXVLSGDWSYS3IWLTDKNS3RR5RQDR3VBQZ7ACLULG2F",
+        weight: 5,
+        type: "sha256_hash",
+      },
     ],
     thresholds: THRESHOLDS,
   };
@@ -236,8 +252,10 @@ test("readAccountSigners maps Horizon's record into tracker inputs and reports f
 
   const ok = await readAccountSignersForTest(fakeServer, ADMIN_1);
   assert.ok(ok.ok);
-  assert.equal(ok.value.signers.length, 2);
+  assert.equal(ok.value.signers.length, 3);
   assert.equal(ok.value.signers[0]?.label, "Signer 1");
+  assert.equal(ok.value.signers[0]?.kind, "ed25519");
+  assert.equal(ok.value.signers[2]?.kind, "hash");
   assert.equal(ok.value.thresholds.med_threshold, 20);
 
   const failing = {
@@ -252,6 +270,165 @@ test("readAccountSigners maps Horizon's record into tracker inputs and reports f
   const failed = await readAccountSignersForTest(failing, ADMIN_1);
   assert.equal(failed.ok, false);
   if (!failed.ok) assert.match(failed.error, /404/);
+});
+
+test("remaining weight is calculated separately for every threshold", () => {
+  const state = evaluateApprovalState({
+    signers: signers(),
+    thresholds: THRESHOLDS,
+    signatures: [{ signer: ADMIN_1 }],
+  });
+  assert.equal(state.remainingWeight, 10, "the governing medium threshold is 10 short");
+  assert.deepEqual(
+    state.thresholds.map((threshold) => [
+      threshold.level,
+      threshold.requiredWeight,
+      threshold.collectedWeight,
+      threshold.remainingWeight,
+      threshold.met,
+    ]),
+    [
+      ["low", 0, 10, 0, true],
+      ["med", 20, 10, 10, false],
+      ["high", 30, 10, 20, false],
+    ],
+  );
+});
+
+test("threshold boundaries: exact weight is ready, one below is one short", () => {
+  const exact = evaluateApprovalState({
+    signers: signers(),
+    thresholds: { low_threshold: 0, med_threshold: 10, high_threshold: 30 },
+    signatures: [{ signer: ADMIN_1 }],
+  });
+  assert.equal(exact.ready, true);
+  assert.equal(exact.remainingWeight, 0);
+  assert.equal(exact.thresholds[1]?.met, true);
+
+  const oneShort = evaluateApprovalState({
+    signers: signers(),
+    thresholds: { low_threshold: 0, med_threshold: 11, high_threshold: 30 },
+    signatures: [{ signer: ADMIN_1 }],
+  });
+  assert.equal(oneShort.ready, false);
+  assert.equal(oneShort.remainingWeight, 1);
+  assert.equal(oneShort.thresholds[1]?.remainingWeight, 1);
+  assert.equal(oneShort.thresholds[1]?.met, false);
+});
+
+test("a removed signer's signature cannot reduce the remaining weight", () => {
+  const state = evaluateApprovalState({
+    // ADMIN_1 is no longer in the account's signer set, but the envelope still
+    // carries their signature.
+    signers: signers().slice(1),
+    thresholds: THRESHOLDS,
+    signatures: [{ signer: ADMIN_1 }],
+  });
+  assert.equal(state.collectedWeight, 0);
+  assert.equal(state.remainingWeight, 20);
+  assert.deepEqual(
+    state.signers.map((signer) => signer.status),
+    ["pending", "pending"],
+  );
+});
+
+test("duplicate signatures are counted once and reported", () => {
+  const state = evaluateApprovalState({
+    signers: signers(),
+    thresholds: THRESHOLDS,
+    signatures: [{ signer: ADMIN_1 }, { signer: ADMIN_1 }, { signer: ADMIN_2 }],
+  });
+  assert.equal(state.collectedWeight, 20, "a repeated signature adds no weight");
+  assert.equal(state.ready, true);
+  assert.equal(state.remainingWeight, 0);
+  assert.deepEqual(state.duplicateSignatures, [ADMIN_1]);
+});
+
+test("unsupported signer data downgrades remaining weight to unknown, never to zero", () => {
+  const state = evaluateApprovalState({
+    signers: [
+      { key: ADMIN_1, weight: 10, label: "Admin 1", kind: "ed25519" },
+      {
+        key: "TBUQNML5TT5ZNFKXVLSGDWSYS3IWLTDKNS3RR5RQDR3VBQZ7ACLULG2F",
+        weight: 30,
+        label: "Hash signer",
+        kind: "hash",
+      },
+    ],
+    thresholds: THRESHOLDS,
+    signatures: [{ signer: ADMIN_1 }],
+  });
+  assert.equal(state.coverage, "unknown");
+  assert.equal(state.remainingWeight, null, "a lower bound is not a definite shortfall");
+  assert.equal(state.thresholds[1]?.remainingWeight, null);
+  assert.equal(state.thresholds[0]?.remainingWeight, 0, "a met threshold is still known to be met");
+  assert.equal(state.unattributableSigners.length, 1);
+  assert.equal(state.unattributableSigners[0]?.label, "Hash signer");
+  assert.equal(
+    remainingWeightSummary(state),
+    "Remaining weight at the medium threshold is unknown: 1 signer of a type that cannot be matched from envelope signatures.",
+  );
+
+  // Even an incomplete read can prove the envelope is already over the line.
+  const alreadyMet = evaluateApprovalState({
+    signers: [
+      { key: ADMIN_1, weight: 10, label: "Admin 1", kind: "ed25519" },
+      {
+        key: "TBUQNML5TT5ZNFKXVLSGDWSYS3IWLTDKNS3RR5RQDR3VBQZ7ACLULG2F",
+        weight: 30,
+        label: "Hash signer",
+        kind: "hash",
+      },
+    ],
+    thresholds: { low_threshold: 0, med_threshold: 10, high_threshold: 30 },
+    signatures: [{ signer: ADMIN_1 }],
+  });
+  assert.equal(alreadyMet.ready, true);
+  assert.equal(alreadyMet.remainingWeight, 0);
+});
+
+test("ambiguous signature matching is reported as unknown coverage", () => {
+  const state = evaluateApprovalState({
+    signers: signers(),
+    thresholds: THRESHOLDS,
+    signatures: [{ signer: ADMIN_1 }],
+    signatureDataComplete: false,
+  });
+  assert.equal(state.coverage, "unknown");
+  assert.equal(state.remainingWeight, null);
+  assert.match(remainingWeightSummary(state), /could not be matched unambiguously/);
+});
+
+test("the remaining-weight summary never renders an unknown value as zero", () => {
+  const partial = evaluateApprovalState({
+    signers: signers(),
+    thresholds: THRESHOLDS,
+    signatures: [{ signer: ADMIN_1 }],
+  });
+  assert.equal(THRESHOLD_LABELS.med, "Medium threshold");
+  assert.equal(
+    remainingWeightSummary(partial),
+    "10 more signer weight is required at the medium threshold.",
+  );
+  assert.equal(
+    remainingWeightSummary(
+      evaluateApprovalState({
+        signers: signers(),
+        thresholds: THRESHOLDS,
+        signatures: [{ signer: ADMIN_1 }, { signer: ADMIN_2 }],
+      }),
+    ),
+    "No further signer weight is required at the medium threshold.",
+  );
+});
+
+test("Horizon signer types map onto tracker signer kinds", () => {
+  assert.equal(signerKind(undefined), "ed25519");
+  assert.equal(signerKind("ed25519_public_key"), "ed25519");
+  assert.equal(signerKind("sha256_hash"), "hash");
+  assert.equal(signerKind("preauth_tx"), "preauth");
+  assert.equal(signerKind("ed25519_signed_payload"), "signed_payload");
+  assert.equal(signerKind("something_new"), "unknown");
 });
 
 /** Indirection so the test imports the real function while keeping the fake server type honest. */

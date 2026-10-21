@@ -19,7 +19,12 @@
 
 import { Horizon, StrKey, TransactionBuilder } from "@stellar/stellar-sdk";
 import { NETWORK } from "./network.ts";
-import type { EnvelopeSignature, MultisigSigner, MultisigThresholds } from "./multisig.ts";
+import type {
+  EnvelopeSignature,
+  MultisigSigner,
+  MultisigThresholds,
+  SignerKind,
+} from "./multisig.ts";
 
 export type HorizonReadResult<T> = { ok: true; value: T } | { ok: false; error: string };
 
@@ -43,6 +48,31 @@ export function defaultHorizonUrl(): string {
 interface HorizonSignerRecord {
   key: string;
   weight: number;
+  /** Horizon's signer type: `ed25519_public_key`, `sha256_hash`, … */
+  type?: string;
+}
+
+/**
+ * Map Horizon's signer `type` onto the tracker's signer kinds.
+ *
+ * An unrecognised (or absent) type is `unknown`, which the evaluator treats as
+ * unattributable — the conservative choice: claiming an exact remaining weight
+ * is worse than saying it cannot be known.
+ */
+export function signerKind(type: string | undefined): SignerKind {
+  switch (type) {
+    case undefined:
+    case "ed25519_public_key":
+      return "ed25519";
+    case "sha256_hash":
+      return "hash";
+    case "preauth_tx":
+      return "preauth";
+    case "ed25519_signed_payload":
+      return "signed_payload";
+    default:
+      return "unknown";
+  }
 }
 
 interface HorizonAccountRecord {
@@ -75,6 +105,7 @@ export async function readAccountSigners(
       key: signer.key,
       weight: signer.weight,
       label: defaultSignerLabel(index),
+      kind: signerKind(signer.type),
     }));
     return {
       ok: true,
@@ -129,6 +160,38 @@ export function signerHint(signerKey: string): string | null {
     // match an Ed25519 signature hint.
     return null;
   }
+}
+
+/**
+ * Match envelope signatures to account signers by 4-byte hint.
+ *
+ * A hint is only 4 bytes, so distinct signers can share one. When a hint maps
+ * to more than one signer the match is reported as ambiguous rather than
+ * arbitrarily picking the first: the caller must downgrade the remaining-weight
+ * answer to "unknown" instead of attributing weight to the wrong key.
+ */
+export function matchEnvelopeSignatures(
+  signatures: readonly EnvelopeSignature[],
+  signers: readonly MultisigSigner[],
+): { signatures: EnvelopeSignature[]; ambiguousHints: string[] } {
+  const byHint = new Map<string, string[]>();
+  for (const signer of signers) {
+    const hint = signerHint(signer.key);
+    if (hint === null) continue;
+    const key = `hint:${hint}`;
+    byHint.set(key, [...(byHint.get(key) ?? []), signer.key]);
+  }
+
+  const ambiguousHints = [...byHint.entries()]
+    .filter(([, keys]) => keys.length > 1)
+    .map(([hint]) => hint);
+
+  return {
+    signatures: signatures.map((signature) => ({
+      signer: byHint.get(signature.signer)?.[0] ?? signature.signer,
+    })),
+    ambiguousHints,
+  };
 }
 
 /**

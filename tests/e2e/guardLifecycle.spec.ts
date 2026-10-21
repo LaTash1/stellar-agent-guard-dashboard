@@ -14,6 +14,7 @@
  * telling the truth, this test goes red even when the mock is happy.
  */
 
+import { readFileSync } from "node:fs";
 import { expect, test, type Page } from "@playwright/test";
 import { StrKey } from "@stellar/stellar-sdk";
 import { installFreighterMock, MOCK_ADMIN_ADDRESS } from "./walletMock.ts";
@@ -122,6 +123,46 @@ test.describe("guard lifecycle: deploy → configure → freeze → unfreeze", (
     });
     await expect(outcome.locator(".tiny.mono")).toHaveText(predicted);
     await expect(outcome.getByText("submitted").first()).toBeVisible();
+
+    // The handoff record (#396) is built from the same outcome, and its verified
+    // claim is the live read — not the fact that a transaction was submitted.
+    const receiptPanel = page.locator(".notice.info", {
+      hasText: "Deployment verification receipt",
+    });
+    await expect(receiptPanel).toBeVisible();
+    await expect(receiptPanel).toContainText("Verification: verified");
+    const downloadPromise = page.waitForEvent("download");
+    await receiptPanel.getByRole("button", { name: "Download receipt" }).click();
+    const download = await downloadPromise;
+    const receiptPath = await download.path();
+    expect(receiptPath).not.toBeNull();
+    const receipt = JSON.parse(readFileSync(receiptPath!, "utf8")) as {
+      kind: string;
+      schemaVersion: number;
+      generator: { provenance: string };
+      disclaimer: string;
+      network: { name: string };
+      addresses: { predicted: string; deployed: string };
+      artifact: { pinnedHash: string; pinnedBytes: number };
+      verification: { status: string; verified: boolean };
+      transactions: Array<{ outcome: string; hash: string | null }>;
+    };
+    expect(receipt.kind).toBe("stellar-agent-guard.deployment-receipt");
+    expect(receipt.schemaVersion).toBe(1);
+    expect(receipt.generator.provenance).toBe("client-generated");
+    expect(receipt.disclaimer).toMatch(/not a signed credential/i);
+    expect(receipt.network.name).toBe("testnet");
+    expect(receipt.addresses.predicted).toBe(predicted);
+    expect(receipt.addresses.deployed).toBe(predicted);
+    expect(receipt.verification.status).toBe("verified");
+    expect(receipt.verification.verified).toBe(true);
+    expect(receipt.artifact.pinnedBytes).toBeGreaterThan(0);
+    expect(receipt.transactions.some((tx) => tx.outcome === "submitted")).toBe(true);
+    // Nothing a key, an envelope or a wallet session would look like.
+    const serialised = JSON.stringify(receipt);
+    expect(serialised).not.toMatch(/"S[A-Z2-7]{55}"/);
+    expect(serialised).not.toMatch(/AAAAAg[A-Za-z0-9+/=]{16,}/);
+    expect(serialised).not.toMatch(/freighter|sessionToken|secretKey|signedXdr/i);
 
     // ── Step 2: initialize with the parameters entered above ───────────────
     await page.getByRole("button", { name: "Sign and initialize" }).click();

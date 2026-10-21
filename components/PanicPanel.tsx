@@ -1,6 +1,8 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import type { GuardStatus } from "stellar-agent-guard-sdk";
+import type { rpc } from "@stellar/stellar-sdk";
 import type { InvokeResult } from "../lib/guard/submit.ts";
 import {
   freezeGuard,
@@ -8,11 +10,32 @@ import {
   unfreezeGuard,
   type FreezeSimulationResult,
 } from "../lib/guard/guardOps.ts";
+import { readNativeXlmBalance } from "../lib/guard/chain.ts";
+import type { ReadResult } from "../lib/guard/chain.ts";
+import {
+  FREEZE_CHALLENGE_SUFFIX_LENGTH,
+  FREEZE_CHALLENGE_THRESHOLD_XLM,
+  freezeChallengeMatches,
+  requiresFreezeChallenge,
+} from "../lib/guard/freezeChallenge.ts";
+import { formatStroops, formatStroopsWithUnit } from "../lib/guard/formatters.ts";
 import { refusedEventsFromDiagnostics } from "../lib/guard/telemetry.ts";
 import { useGuard } from "./GuardProvider.tsx";
 import { WRITE_DISABLED_HINT, writeControlState } from "../lib/guard/observerMode.ts";
+import { evaluateOffline, useOnlineStatus } from "../lib/guard/online.ts";
 import { ErrorBlock, starLink } from "./bits.tsx";
+import {
+  freezeConfirmed,
+  freezeFailed,
+  writeFailureReason,
+  type FreezeAction,
+} from "../lib/guard/announceCopy.ts";
+import { useModalFocus } from "../lib/guard/useModalFocus.ts";
+import { noteVerifiedOutcome } from "../lib/guard/statusTransitions.ts";
+import { announce } from "../lib/guard/useAnnounce.ts";
+import { usePwaActivity } from "../lib/guard/usePwaActivity.ts";
 import { CopyButton } from "./CopyButton.tsx";
+import { useDemoMode } from "../lib/guard/useDemoMode.ts";
 
 /**
  * The emergency panic button.
@@ -22,9 +45,28 @@ import { CopyButton } from "./CopyButton.tsx";
  * the contract itself reports, and it refuses to claim success if the flag did
  * not actually change — a write that was signed and included but did not take
  * effect must not be reported as a freeze.
+ *
+ * That same reasoning decides what is spoken (issue #30). A screen-reader
+ * operator cannot see the badge flip or the notice appear, so the verified
+ * outcome is announced: the confirmation, or the failure *with its reason*,
+ * which is the part that says whether the account is frozen right now. The write
+ * path already announces the transaction itself; this is the announcement about
+ * the effect. It leaves through the shell's live region by way of `announce()`,
+ * so it survives the dialog being torn down by the very interaction that
+ * produced it.
  */
 
 type Phase = "idle" | "confirming" | "signing" | "verifying" | "done";
+
+/**
+ * The live XLM balance the freeze-challenge threshold is compared against
+ * (issue #15). Three states, deliberately no fourth: `unread` covers both
+ * "not read yet" and demo mode (which makes no RPC call at all), and `error`
+ * keeps the failure's detail so the dialog can say *why* the typed
+ * confirmation is showing. Both non-`ok` states fail safe to the challenge.
+ */
+type BalanceState =
+  { status: "unread" } | { status: "ok"; stroops: bigint } | { status: "error"; detail: string };
 
 interface Report {
   action: "freeze" | "unfreeze";
@@ -37,6 +79,61 @@ interface Report {
 }
 
 /**
+/**
+ * The announcement for a write that has finished.
+ *
+ * The reason carried by a failure is whichever one explains it best: what the
+ * enforced simulation refused and why, what the network rejected, or — for a
+ * write that was included but changed nothing — the note saying the re-read
+ * disagreed. "Freeze failed" on its own would leave a screen-reader operator
+ * with less than the sighted operator can read, at the exact moment when the
+ * only question is whether the account is frozen.
+ */
+function speakFreezeOutcome(
+  action: FreezeAction,
+  confirmed: boolean,
+  note: string,
+  result?: InvokeResult,
+): void {
+  const spoken = confirmed
+    ? freezeConfirmed(action)
+    : freezeFailed(action, result ? writeFailureReason(result, note) : note);
+  announce(spoken.message, spoken.priority);
+}
+
+/**
+ * The chain operations this panel drives.
+ *
+ * Injected rather than imported straight into the handler so the a11y
+ * behaviour can be asserted without a wallet or a network: the ordering that
+ * matters (announce the result, then let the dialog close and restore focus)
+ * is a property of the panel, not of the chain, and it is testable only if the
+ * chain behind it can be replaced. Defaults are the real operations, so the
+ * console's own pages — and the end-to-end specs that drive them — run the
+ * production path unchanged. Same seam discipline as the perf harness's
+ * `__guardFeedInject` and `pollFleet`'s `_readSnapshot`.
+ */
+export interface PanicPanelOps {
+  freeze: typeof freezeGuard;
+  unfreeze: typeof unfreezeGuard;
+  readStatus: (
+    server: rpc.Server,
+    guard: string,
+    source?: string,
+  ) => Promise<ReadResult<GuardStatus>>;
+}
+
+const DEFAULT_OPS: PanicPanelOps = {
+  freeze: freezeGuard,
+  unfreeze: unfreezeGuard,
+  // Dynamic, as before: `chain.ts` is not needed until a write is verified, and
+  // keeping it out of the panel's first-paint graph is the point of the import.
+  readStatus: async (server, guard, source) =>
+    (await import("../lib/guard/chain.ts")).readStatus(server, guard, source),
+};
+
+/**
+
  * Render a freeze dry run.
  *
  * The banner is not decoration: a simulation output looks similar enough to a
@@ -145,8 +242,9 @@ function DryRunReport({
   );
 }
 
-export function PanicPanel() {
+export function PanicPanel({ ops }: { ops?: Partial<PanicPanelOps> }) {
   const { signer, guard, server, refresh, snapshot, pushEvents, wallet, notifyTabs } = useGuard();
+  const { freeze, unfreeze, readStatus: readStatusAfter } = { ...DEFAULT_OPS, ...ops };
   const [phase, setPhase] = useState<Phase>("idle");
   const [report, setReport] = useState<Report | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -156,84 +254,111 @@ export function PanicPanel() {
   // while the read-only call is in flight.
   const [simulation, setSimulation] = useState<FreezeSimulationResult | null>(null);
   const [simulating, setSimulating] = useState(false);
+  // Freeze-challenge state (issue #15): the live balance that decides the
+  // confirmation's shape, and the operator's typed answer.
+  const [balance, setBalance] = useState<BalanceState>({ status: "unread" });
+  const [challengeInput, setChallengeInput] = useState("");
+  // A freeze that is signing or awaiting the post-write read is a pending
+  // write: an update must not replace the app underneath it (#398).
+  usePwaActivity(phase === "signing" || phase === "verifying", "write");
+  const demoMode = useDemoMode();
+  // An emergency write is still a write: when the live status read it depends
+  // on failed, or the browser is offline, the control says why instead of
+  // offering an action that cannot be prepared safely (issue #348).
+  const online = useOnlineStatus();
+  const offlineView = evaluateOffline({
+    online,
+    liveReadFailed: snapshot !== null && !snapshot.status.ok,
+  });
+  const preflightUnavailable = offlineView.writesDisabled ? offlineView.detail : null;
 
   const dialogRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
+  // Newest balance read wins: every (re)read bumps this token, and a reply
+  // that arrives after a newer read — or after unmount — is dropped instead
+  // of overwriting fresher state with a stale number.
+  const balanceToken = useRef(0);
   const confirming = phase === "confirming";
+
+  /**
+   * Read the guard's live XLM balance — the threshold input for the freeze
+   * challenge. Called on mount and again each time the confirm dialog opens,
+   * because the decision must use a *current* number: an account that was
+   * small when the page loaded and large by the time the operator freezes it
+   * has to be challenged. Demo mode makes no RPC call at all, so the balance
+   * stays `unread` there — which shows the challenge, the fail-safe side.
+   */
+  const loadBalance = useCallback(() => {
+    if (demoMode) return;
+    const token = ++balanceToken.current;
+    const settle = (state: BalanceState): void => {
+      if (token !== balanceToken.current) return;
+      setBalance(state);
+    };
+    void readNativeXlmBalance(server, guard)
+      .then((result) => {
+        settle(
+          result.ok
+            ? { status: "ok", stroops: result.value }
+            : { status: "error", detail: result.error },
+        );
+      })
+      .catch((caught) => {
+        settle({
+          status: "error",
+          detail: caught instanceof Error ? caught.message : String(caught),
+        });
+      });
+  }, [server, guard, demoMode]);
+
+  useEffect(() => {
+    loadBalance();
+    return () => {
+      // Invalidate the in-flight read on unmount or context change, so its
+      // reply can neither update a dead dialog nor cross a guard switch.
+      balanceToken.current += 1;
+    };
+  }, [loadBalance]);
+
+  // ── Freeze-challenge decision (issue #15) ──────────────────────────────
+  // `null` for every non-`ok` balance (unread/error), which
+  // `requiresFreezeChallenge` maps to "challenge shown": when the stakes are
+  // unknown the friction goes up, never down.
+  const challengeRequired = requiresFreezeChallenge(
+    balance.status === "ok" ? balance.stroops : null,
+  );
+  const challengeSatisfied = !challengeRequired || freezeChallengeMatches(challengeInput, guard);
+  const challengeError =
+    challengeRequired && challengeInput.trim() !== "" && !challengeSatisfied
+      ? `That is not the last ${FREEZE_CHALLENGE_SUFFIX_LENGTH} characters — type them exactly as shown.`
+      : null;
 
   // Focus management for the confirmation dialog: move focus in on open, keep
   // Tab cycling inside it, close on Escape, and restore focus to the trigger
   // whenever the dialog goes away. Without this a modal is either a keyboard
   // trap (focus escapes into the page behind it) or a dead end (focus lands
   // nowhere on dismissal) — both fail WCAG 2.1 AA keyboard requirements.
-  // (Extracted into the shared ConfirmDialog in issue #34.)
-  useEffect(() => {
-    if (!confirming) return;
-    const dialog = dialogRef.current;
-    if (!dialog) return;
-
-    const focusables = () =>
-      Array.from(
-        dialog.querySelectorAll<HTMLElement>(
-          'button:not([disabled]), input:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])',
-        ),
-      );
-
-    // Focus the dialog itself first, so a screen reader announces the title
-    // before the operator tabs into its controls.
-    dialog.focus();
-
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
-        event.preventDefault();
-        setPhase("idle");
-        setAcknowledged(false);
-        return;
-      }
-      if (event.key !== "Tab") return;
-      const items = focusables();
-      if (items.length === 0) {
-        event.preventDefault();
-        dialog.focus();
-        return;
-      }
-      const first = items[0]!;
-      const last = items[items.length - 1]!;
-      const active = document.activeElement as HTMLElement | null;
-      const inside = active !== null && dialog.contains(active);
-      if (event.shiftKey && (active === first || !inside)) {
-        event.preventDefault();
-        last.focus();
-      } else if (!event.shiftKey && (active === last || !inside)) {
-        event.preventDefault();
-        first.focus();
-      }
-    };
-
-    document.addEventListener("keydown", onKeyDown, true);
-    return () => {
-      document.removeEventListener("keydown", onKeyDown, true);
-      // Dismissal in any form (Escape, Cancel, or proceeding to sign) returns
-      // focus to the trigger. The trigger row is re-created when the dialog
-      // closes, and React re-attaches refs during the commit — before this
-      // cleanup runs — so the ref already points at the live button. Reading
-      // `.current` at cleanup time is the whole point; a snapshot taken when
-      // the effect started would be null (the row is unmounted while the
-      // dialog is open) or a detached node.
-      // eslint-disable-next-line react-hooks/exhaustive-deps -- deliberate late ref read, see above
-      triggerRef.current?.focus();
-    };
-  }, [confirming]);
+  useModalFocus({
+    open: confirming,
+    containerRef: dialogRef,
+    returnFocusRef: triggerRef,
+    onDismiss: () => {
+      setPhase("idle");
+      setAcknowledged(false);
+    },
+  });
 
   const alreadyFrozen = snapshot?.status.ok ? snapshot.status.value.admin_frozen : null;
   // The panic button is the write an operator reaches for under pressure, so an
   // inert one has to say why in the same words as every other control (#101).
   const freezeControl = writeControlState(wallet, {
     extraDisabled: alreadyFrozen === true,
+    preflightUnavailable,
     label: "freeze this account",
   });
   const unfreezeControl = writeControlState(wallet, {
     extraDisabled: alreadyFrozen === false,
+    preflightUnavailable,
     label: "unfreeze this account",
   });
 
@@ -256,7 +381,7 @@ export function PanicPanel() {
     }
   }
 
-  async function run(action: "freeze" | "unfreeze", exportOnly = false) {
+  async function run(action: FreezeAction, exportOnly = false) {
     setError(null);
     setReport(null);
     setPhase("signing");
@@ -264,8 +389,8 @@ export function PanicPanel() {
       const walletSigner = signer();
       const result =
         action === "freeze"
-          ? await freezeGuard({ server, signer: walletSigner, guard, exportOnly })
-          : await unfreezeGuard({ server, signer: walletSigner, guard, exportOnly });
+          ? await freeze({ server, signer: walletSigner, guard, exportOnly })
+          : await unfreeze({ server, signer: walletSigner, guard, exportOnly });
 
       // Surface any refused-decision diagnostics the write produced, so a refusal
       // appears in the feed rather than only in this panel.
@@ -288,23 +413,31 @@ export function PanicPanel() {
       // Re-read the contract's own view. This is the step that makes the claim
       // real: the UI is not the source of truth, `status()` is.
       setPhase("verifying");
-      const { readStatus } = await import("../lib/guard/chain.ts");
-      const after = await readStatus(server, guard, wallet?.address);
+      const after = await readStatusAfter(server, guard, wallet?.address);
       const adminFrozenAfter = after.ok ? after.value.admin_frozen : null;
       const expected = action === "freeze";
       const confirmed = adminFrozenAfter !== null && adminFrozenAfter === expected;
+      const note = !after.ok
+        ? `the write returned, but status() could not be re-read to confirm its effect: ${after.error}`
+        : confirmed
+          ? `status().admin_frozen now reads ${adminFrozenAfter}, which is the ${action} taking effect`
+          : `status().admin_frozen reads ${adminFrozenAfter} — the intended effect is NOT visible on chain`;
 
-      setReport({
-        action,
-        result,
-        adminFrozenAfter,
-        confirmed,
-        note: !after.ok
-          ? `the write returned, but status() could not be re-read to confirm its effect: ${after.error}`
-          : confirmed
-            ? `status().admin_frozen now reads ${adminFrozenAfter}, which is the ${action} taking effect`
-            : `status().admin_frozen reads ${adminFrozenAfter} — the intended effect is NOT visible on chain`,
-      });
+      setReport({ action, result, adminFrozenAfter, confirmed, note });
+
+      // Announced before the phase change that closes the dialog, so the message
+      // is already in the shell's queue when the dialog is torn down and focus
+      // moves back to the trigger. A write that was included but did not take
+      // effect is announced as the failure it is, with the reason.
+      speakFreezeOutcome(action, confirmed, note, result);
+      if (confirmed) {
+        // The effect is now on chain and has been announced. Recorded so the
+        // next poll does not repeat the same fact back at the operator — and
+        // recorded *only* when confirmed, so a freeze that lands anyway after a
+        // failed write is still announced when the poll finds it.
+        noteVerifiedOutcome({ adminFrozen: expected });
+      }
+
       setPhase("done");
       // Only a broadcast write can have moved the chain. Tell the other tabs so
       // they re-read instead of showing the pre-freeze world for up to a poll
@@ -312,7 +445,11 @@ export function PanicPanel() {
       if (result.kind === "submitted") notifyTabs("FREEZE_STATE_CHANGED", { payload: { action } });
       await refresh();
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : String(caught));
+      const detail = caught instanceof Error ? caught.message : String(caught);
+      setError(detail);
+      // The dialog is about to reopen in its idle state, so the failure has to be
+      // spoken now: nothing else on screen will change once focus is restored.
+      speakFreezeOutcome(action, false, detail);
       setPhase("idle");
       setAcknowledged(false);
     }
@@ -355,8 +492,13 @@ export function PanicPanel() {
             title={freezeControl.title}
             onClick={() => {
               setAcknowledged(false);
+              setChallengeInput("");
               setPhase("confirming");
               setReport(null);
+              // Re-read the balance at the decision point, not just at mount:
+              // the threshold must be judged against the account's exposure
+              // *now*, and a read still in flight keeps the challenge on.
+              loadBalance();
             }}
           >
             Freeze this account
@@ -381,7 +523,7 @@ export function PanicPanel() {
             className="secondary"
             disabled={!wallet || simulating}
             onClick={() => void runSimulation()}
-            title="Simulate freeze() read-only: no wallet prompt, no broadcast"
+            title="Simulate freeze() read-only: no wallet prompt, no broadcast (docs/glossary.md — Pre-flight Simulation)"
           >
             {simulating ? "Simulating…" : "Simulate freeze (dry run)"}
           </button>
@@ -419,17 +561,73 @@ export function PanicPanel() {
                 second signed <code>unfreeze()</code>.
               </label>
             </div>
+            {challengeRequired && (
+              <div data-testid="freeze-challenge-block">
+                <p className="tiny" id="freeze-challenge-why">
+                  {balance.status === "ok" ? (
+                    <>
+                      This guard holds <strong>{formatStroopsWithUnit(balance.stroops)}</strong> —
+                      at or above the{" "}
+                      {formatStroops(BigInt(FREEZE_CHALLENGE_THRESHOLD_XLM), { decimals: 0 })} XLM
+                      large-exposure threshold.{" "}
+                    </>
+                  ) : balance.status === "error" ? (
+                    <>
+                      The balance could not be read ({balance.detail}), so this freeze keeps the
+                      typed confirmation — when the stakes are unknown the friction goes up, never
+                      down.{" "}
+                    </>
+                  ) : (
+                    <>
+                      Reading this guard&apos;s live XLM balance; until the read settles, the typed
+                      confirmation stays on.{" "}
+                    </>
+                  )}
+                  Typing the last {FREEZE_CHALLENGE_SUFFIX_LENGTH} characters of the guard address
+                  below prevents an accidental freeze — deliberate friction against a mis-click, not
+                  protection against anyone who can already see this page.
+                </p>
+                <p className="tiny mono" style={{ margin: "0 0 6px" }}>
+                  {guard}
+                </p>
+                <label className="tiny" htmlFor="freeze-challenge">
+                  Last {FREEZE_CHALLENGE_SUFFIX_LENGTH} characters of the guard address
+                </label>
+                <input
+                  id="freeze-challenge"
+                  type="text"
+                  autoComplete="off"
+                  spellCheck={false}
+                  value={challengeInput}
+                  onChange={(event) => setChallengeInput(event.target.value)}
+                  aria-invalid={challengeError === null ? undefined : true}
+                  aria-describedby={`freeze-challenge-why${
+                    challengeError === null ? "" : " freeze-challenge-error"
+                  }`}
+                />
+                {challengeError !== null && (
+                  <p
+                    className="error tiny"
+                    id="freeze-challenge-error"
+                    role="alert"
+                    style={{ marginTop: 6, marginBottom: 0 }}
+                  >
+                    {challengeError}
+                  </p>
+                )}
+              </div>
+            )}
             <div className="row">
               <button
                 className="danger"
-                disabled={!acknowledged}
+                disabled={!acknowledged || !challengeSatisfied}
                 onClick={() => void run("freeze")}
               >
                 Sign freeze
               </button>
               <button
                 className="secondary"
-                disabled={!acknowledged}
+                disabled={!acknowledged || !challengeSatisfied}
                 onClick={() => void run("freeze", true)}
               >
                 Export XDR

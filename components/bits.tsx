@@ -5,8 +5,10 @@ import Link from "next/link";
 import { useEffect, useState } from "react";
 import type { ReactNode } from "react";
 import type { ReadResult } from "../lib/guard/chain.ts";
+import { SKELETON_CLASS } from "../lib/guard/statusReadState.ts";
 import { ENFORCEMENT_SCOPE_STATEMENT } from "../lib/guard/network.ts";
 import { lookupLabel, subscribeAddressBook } from "../lib/guard/addressBook.ts";
+import { usePrivacy } from "../lib/guard/privacyStore.ts";
 import { CopyButton } from "./CopyButton.tsx";
 import {
   formatRawStroops,
@@ -45,13 +47,48 @@ export function Tabs() {
 export function ScopeNotice({ compact = false }: { compact?: boolean }) {
   return (
     <div className="notice">
-      <strong>What the policy engine enforces</strong>
+      <strong title="Terminology defined in docs/glossary.md: SAC (Stellar Asset Contract), Soroban Auth Context, __check_auth, Rolling Window">
+        What the policy engine enforces
+      </strong>
       <span className="tiny">{ENFORCEMENT_SCOPE_STATEMENT}</span>
       {!compact && (
         <div className="tiny muted" style={{ marginTop: 6 }}>
           This boundary is a property of the platform, not a gap this interface hides.
         </div>
       )}
+    </div>
+  );
+}
+
+/**
+ * The warning tier: one prominent banner for a state that is *safe* but not
+ * doing what the operator probably assumes it is doing.
+ *
+ * Established here by the default-deny status pass (issue #25) and shared, so
+ * the telemetry feed's per-row severity (issue #26) and the pending-status
+ * surfaces reuse one set of tokens rather than each inventing a red. `tier`
+ * picks the intensity: `warn` for "working as designed, read this", `danger` for
+ * "frozen/refused, act now" — the same two tiers as `.notice` and `.error`.
+ *
+ * `role="status"` announces it politely rather than interrupting: a state that
+ * is already true when the page loads is context, not an event.
+ */
+export function WarningBanner({
+  tier = "warn",
+  title,
+  children,
+  action,
+}: {
+  tier?: "warn" | "danger";
+  title: string;
+  children?: ReactNode;
+  action?: ReactNode;
+}) {
+  return (
+    <div className={`notice${tier === "danger" ? " danger" : ""}`} data-tier={tier} role="status">
+      <strong>{title}</strong>
+      {children}
+      {action}
     </div>
   );
 }
@@ -137,20 +174,59 @@ export function ReadSkeleton({ label }: { label: string }) {
 /**
  * Render a read's value, or its failure.
  *
- * There is no third branch on purpose: a read that did not succeed has no value
- * to show, and substituting a zero would make an outage indistinguishable from a
- * genuinely empty policy.
+ * Sized in `em` so it inherits the exact font metrics of the slot it sits in
+ * (`.stat .v`, `.stat .n`, …) and occupies the same height the resolved value
+ * will — no jump, no shift. `aria-hidden="true"` keeps screen readers out:
+ * the surrounding container's `aria-busy` already announces "this region is
+ * loading", and a bar with no meaning would only be noise.
+ */
+export function Skeleton({ lines = 1, className = "" }: { lines?: number; className?: string }) {
+  return (
+    <>
+      {Array.from({ length: lines }, (_, index) => (
+        <span
+          key={index}
+          className={`${SKELETON_CLASS}${index > 0 ? " slim" : ""}${className ? ` ${className}` : ""}`}
+          aria-hidden="true"
+        />
+      ))}
+    </>
+  );
+}
+
+/**
+ * Render a read through all three of its states: pending → skeleton, failed →
+ * the error, resolved → the value.
+ *
+ * The failure branch is the same explicit error block it has always been —
+ * there is no default-on-failure path, because a substituted zero would make
+ * an outage indistinguishable from a genuinely empty policy (README, no mock
+ * state). What is new is the first branch: while the read is in flight the slot
+ * shows a skeleton instead of nothing, so the panel's height does not collapse
+ * and jump when the value lands.
  */
 export function Read<T>({
   result,
   label,
   render,
+  pendingLines = 1,
 }: {
-  result: ReadResult<T>;
+  result: ReadResult<T> | null | undefined;
   label: string;
   render: (value: T) => ReactNode;
+  /** Skeleton lines to reserve while the read is pending (value + note slots). */
+  pendingLines?: number;
 }) {
-  if (!result.ok) return <ErrorBlock title={`${label}: read failed`} detail={result.error} />;
+  if (result === null || result === undefined) {
+    return (
+      <span aria-busy="true" className="read-pending">
+        <Skeleton lines={pendingLines} />
+      </span>
+    );
+  }
+  if (!result.ok) {
+    return <ErrorBlock title={`${label}: read failed`} detail={result.error} />;
+  }
   return <>{render(result.value)}</>;
 }
 
@@ -220,20 +296,48 @@ export function AddressText({
   className?: string;
 }): ReactNode {
   const label = useAddressLabel(address);
+  const { masked } = usePrivacy();
   const truncated = label ? short(address, 4, 4) : short(address);
+  const display = masked
+    ? label
+      ? `${label} (••••••••)`
+      : "••••••••"
+    : label
+      ? `${label} (${truncated})`
+      : truncated;
+
   return (
-    <span className={className ?? "mono"} title={address}>
-      {label ? `${label} (${truncated})` : truncated}
+    <span
+      className={className ?? "mono"}
+      title={address}
+      aria-label={masked ? `Masked address${label ? ` for ${label}` : ""}` : undefined}
+    >
+      {display}
     </span>
   );
 }
 
-export function relativeTime(iso: string | null): string {
-  if (!iso) return "never";
-  const seconds = Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 1000));
-  if (seconds < 60) return `${seconds}s ago`;
-  if (seconds < 3600) return `${Math.round(seconds / 60)}m ago`;
-  return `${Math.round(seconds / 3600)}h ago`;
+import { formatTimeAgo } from "../lib/guard/time.ts";
+
+export function TimeAgo({ iso, suffix = "" }: { iso: string | null; suffix?: string }) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 5000);
+    return () => clearInterval(id);
+  }, []);
+
+  if (!iso) return <span>never</span>;
+
+  const ts = Math.floor(new Date(iso).getTime() / 1000);
+  const nowSecs = Math.floor(now / 1000);
+  const rel = formatTimeAgo(ts, nowSecs);
+
+  return (
+    <time dateTime={iso} title={iso} className="timeago">
+      {rel}
+      {suffix}
+    </time>
+  );
 }
 
 /**
@@ -313,11 +417,26 @@ export interface AmountDisplayProps extends FormatStroopsOptions {
  */
 export function AmountDisplay({ stroops, symbol, decimals }: AmountDisplayProps) {
   const [showRaw, setShowRaw] = useState(false);
+  const { masked } = usePrivacy();
   const human = formatStroopsWithUnit(stroops, {
     ...(symbol !== undefined ? { symbol } : {}),
     ...(decimals !== undefined ? { decimals } : {}),
   });
   const raw = formatRawStroops(stroops);
+
+  if (masked) {
+    const unit = symbol ?? "XLM";
+    return (
+      <span
+        className="mono"
+        aria-label={`Masked amount in ${unit}`}
+        title="Amount masked for privacy"
+      >
+        {`•••••• ${unit} (masked)`}
+      </span>
+    );
+  }
+
   return (
     <button
       type="button"
@@ -326,7 +445,11 @@ export function AmountDisplay({ stroops, symbol, decimals }: AmountDisplayProps)
       aria-label={
         showRaw ? `Raw amount: ${raw}` : `Amount: ${human}. Activate to show raw stroops.`
       }
-      title={showRaw ? "Show human-readable amount" : "Show raw stroops"}
+      title={
+        showRaw
+          ? "Show human-readable amount"
+          : "Show raw stroops — the smallest unit of an asset (docs/glossary.md — Stroop)"
+      }
     >
       {showRaw ? raw : human}
     </button>

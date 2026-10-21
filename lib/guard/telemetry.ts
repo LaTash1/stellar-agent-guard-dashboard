@@ -27,9 +27,11 @@ import {
   topicSymbols,
   type GuardEvent,
   type PollResult,
+  guardEventId,
 } from "stellar-agent-guard-sdk";
 import { scValToNative, xdr, type rpc } from "@stellar/stellar-sdk";
 import { NETWORK } from "./network.ts";
+import { withTimeout } from "./timeout.ts";
 import { estimateLedgerAtTime, type LedgerAnchor, type TimeRange } from "./ledgerTime.ts";
 
 /**
@@ -94,6 +96,9 @@ export class GuardFeed {
   /** The raw `getEvents` page behind the most recent poll, captured for `raw`. */
   private lastRawEvents: readonly rpc.Api.EventResponse[] = [];
 
+  /** Set by `stop()`. A stopped feed never polls again, even if referenced. */
+  private stopped = false;
+
   constructor(server: rpc.Server, guard: string, rpcUrl: string = NETWORK.rpcUrl) {
     this.guard = guard;
     // The listener decodes and discards the XDR. Hand it a view of the server
@@ -108,22 +113,42 @@ export class GuardFeed {
     this.listener = new GuardTelemetryListener({ server: recording, guard, rpcUrl });
   }
 
+  /**
+   * Release this feed. The multi-guard supervisor calls this the moment a guard
+   * is removed from the registry, so a reconciled-away listener cannot keep
+   * emitting events through a stale reference.
+   */
+  stop(): void {
+    this.stopped = true;
+  }
+
+  /** True once `stop()` has been called. Exposed for lifecycle assertions. */
+  isStopped(): boolean {
+    return this.stopped;
+  }
+
   /** One page of committed ledger events. Advances the cursor. */
   async pollOnce(limit = 50): Promise<TelemetryPage> {
-    const params: { cursor?: string; limit: number; startLedger?: number } = { limit };
-    if (this.cursor) {
-      params.cursor = this.cursor;
-    } else if (this.latestLedger !== null) {
-      params.startLedger = this.latestLedger;
+    if (this.stopped) {
+      const ledger = this.latestLedger ?? 0;
+      return { events: [], cursor: this.cursor ?? "", latestLedger: ledger, oldestLedger: ledger };
     }
-    this.lastRawEvents = [];
-    const decoded = await this.listener.poll(params);
-    const page = { ...decoded, events: attachLedgerXdr(decoded.events, this.lastRawEvents) };
-    // A page with no events still advances the ledger pointer, so the next poll
-    // does not re-scan a stretch of empty ledgers.
-    this.latestLedger = Math.max(this.latestLedger ?? 0, page.latestLedger);
-    if (page.cursor) this.cursor = page.cursor;
-    return page;
+    return await withTimeout(async () => {
+      const params: { cursor?: string; limit: number; startLedger?: number } = { limit };
+      if (this.cursor) {
+        params.cursor = this.cursor;
+      } else if (this.latestLedger !== null) {
+        params.startLedger = this.latestLedger;
+      }
+      this.lastRawEvents = [];
+      const decoded = await this.listener.poll(params);
+      const page = { ...decoded, events: attachLedgerXdr(decoded.events, this.lastRawEvents) };
+      // A page with no events still advances the ledger pointer, so the next poll
+      // does not re-scan a stretch of empty ledgers.
+      this.latestLedger = Math.max(this.latestLedger ?? 0, page.latestLedger);
+      if (page.cursor) this.cursor = page.cursor;
+      return page;
+    });
   }
 
   /** Where the feed currently is, for display. */
@@ -206,6 +231,76 @@ export class GuardFeed {
   }
 }
 
+/** The slice of `GuardFeed` a coordinator drives. `GuardFeed` satisfies it structurally. */
+export interface PolledFeed {
+  readonly guard: string;
+  pollOnce(limit?: number): Promise<TelemetryPage>;
+  position(): { cursor: string | null; latestLedger: number | null };
+  resetFrom(ledger: number | null): void;
+}
+
+/**
+ * How far back a freshly-switched-to feed asks for history, in ledgers.
+ *
+ * A guard switch must land with context, not a blank page: the SDK's own
+ * default for an unprimed feed is "start at the current head" (its comment:
+ * replaying a year of history by accident is a mean surprise), which is right
+ * for a first watch but wrong for an operator arriving from another guard —
+ * they expect to see what the guard has been doing lately. Priming a new feed
+ * with `latestKnown − FEED_SWITCH_HISTORY_LEDGERS` asks for roughly the last
+ * five minutes (at ~5s ledger closes) without ever replaying a year. Ledgers
+ * are chain-global, so the currently-known head is valid across guards.
+ */
+export const FEED_SWITCH_HISTORY_LEDGERS = 60;
+
+export interface FeedCoordinatorStats {
+  /** Feeds constructed since this coordinator existed. */
+  created: number;
+  /** Feeds replaced because the operator switched identity — each held a cursor
+   * that must never be resumed onto another guard's stream. */
+  abandoned: number;
+}
+
+/**
+ * Exactly one live feed per guard identity, and a fresh cursor on every change.
+ *
+ * Guard switches are where feed data isolation can silently fail: a feed built
+ * for guard A carries A's cursor, and resuming that cursor under guard B would
+ * tail B's stream from a position that meant something on A — wrong-attribution
+ * incidents waiting to happen. The rule is deliberately blunt: a different
+ * guard id means a new `GuardFeed` with a null cursor, and the old feed is
+ * abandoned, never resumed. A rapid A→B→A therefore lands on a *fresh* A stream,
+ * not A's stale position (the deferred-init race dies here, synchronously, by
+ * identity check). Counting is exposed so tests can prove abandonment.
+ */
+export class GuardFeedCoordinator<T extends PolledFeed = PolledFeed> {
+  private feed: T | null = null;
+  private readonly stats: FeedCoordinatorStats = { created: 0, abandoned: 0 };
+  private readonly factory: (guard: string) => T;
+
+  constructor(factory: (guard: string) => T) {
+    this.factory = factory;
+  }
+
+  /** The feed for `guard`: reused when identity matches, replaced when it does not. */
+  ensure(guard: string): T {
+    if (this.feed && this.feed.guard === guard) return this.feed;
+    if (this.feed) this.stats.abandoned += 1;
+    this.feed = this.factory(guard);
+    this.stats.created += 1;
+    return this.feed;
+  }
+
+  /** The live feed, if one exists. Callers poll through this, never a cached ref. */
+  current(): T | null {
+    return this.feed;
+  }
+
+  statsSnapshot(): FeedCoordinatorStats {
+    return { ...this.stats };
+  }
+}
+
 /**
  * Decode refused-decision events out of an attempted write's diagnostics.
  *
@@ -229,14 +324,16 @@ export function refusedEventsFromDiagnostics(
   // The SDK skips events whose topics it does not recognise but keeps the
   // order of the rest, so walk both lists together and pair them by name topic.
   let cursor = 0;
-  return decoded.map((event) => {
+  return decoded.map((event, index) => {
+    const stream = "diagnostic";
+    const id = guardEventId({ ...event, topics: [event.topic], simulationIndex: index });
     while (cursor < normalised.length) {
       const candidate = normalised[cursor++];
       if (topicSymbols(candidate)[0] === event.topic) {
-        return { ...event, observedAt, raw: diagnosticXdr(candidate) };
+        return { ...event, observedAt, id, stream, raw: diagnosticXdr(candidate) };
       }
     }
-    return { ...event, observedAt, raw: null };
+    return { ...event, observedAt, id, stream, raw: null };
   });
 }
 
@@ -257,6 +354,8 @@ export function attachLedgerXdr(
   const observedAt = new Date().toISOString();
   let cursor = 0;
   return decoded.map((event) => {
+    const stream = "committed";
+    const id = guardEventId({ ...event, topics: [event.topic], simulationIndex: null });
     while (cursor < raw.length) {
       const candidate = raw[cursor++]!;
       if (
@@ -267,6 +366,8 @@ export function attachLedgerXdr(
         return {
           ...event,
           observedAt,
+          id,
+          stream,
           raw: {
             eventId: candidate.id,
             topicXdr: candidate.topic.map((topic) => topic.toXDR("base64")),
@@ -277,7 +378,7 @@ export function attachLedgerXdr(
         };
       }
     }
-    return { ...event, observedAt, raw: null };
+    return { ...event, observedAt, id, stream, raw: null };
   });
 }
 
@@ -369,6 +470,27 @@ export interface StreamBuffer {
 
 /** How many rows the feed keeps. The feed is a live view, not an archive. */
 export const STREAM_BUFFER_LIMIT = 250;
+
+/**
+ * A stable identity for an event, so re-polling the same page cannot duplicate
+ * rows. Decoded event data can hold bigints (a heartbeat's `at`), which plain
+ * `JSON.stringify` rejects, so they are written as decimal strings.
+ */
+export function eventKey(event: GuardEvent): string {
+  return [
+    event.source,
+    event.transactionHash ?? "-",
+    event.ledger ?? "-",
+    event.topic,
+    event.decision?.result ?? "-",
+    event.decision?.reason ?? "-",
+    typeof event.data === "object" && event.data !== null
+      ? JSON.stringify(event.data, (_key, value: unknown) =>
+          typeof value === "bigint" ? `${value}n` : value,
+        )
+      : String(event.data),
+  ].join("|");
+}
 
 export function emptyStreamBuffer(): StreamBuffer {
   return { rows: [], pending: [], paused: false, seen: new Set(), dropped: 0 };

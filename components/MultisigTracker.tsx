@@ -19,19 +19,21 @@
 import { useCallback, useState } from "react";
 import { TransactionBuilder } from "@stellar/stellar-sdk";
 import { NETWORK } from "../lib/guard/network.ts";
-import { toHex } from "stellar-agent-guard-sdk";
+import { toHex } from "../lib/guard/scval.ts";
 import {
+  THRESHOLD_LABELS,
   approvalPercent,
   approvalSummary,
   evaluateApprovalState,
   pendingSigners,
+  remainingWeightSummary,
   type MultisigApprovalState,
 } from "../lib/guard/multisig.ts";
 import {
   createHorizonServer,
+  matchEnvelopeSignatures,
   readAccountSigners,
   readEnvelopeSignatures,
-  signerHint,
   unmatchedSignatures,
 } from "../lib/guard/multisigRead.ts";
 import { useGuard } from "./GuardProvider.tsx";
@@ -111,19 +113,15 @@ export function MultisigTracker() {
       // Translate hint-carried envelope signatures into the signer identities
       // the tracker compares, by matching each hint against the account's
       // signers (see `multisigRead.ts` for why only hints are available).
-      const hintToSigner = new Map<string, string>();
-      for (const signer of account.value.signers) {
-        const hint = signerHint(signer.key);
-        if (hint !== null) hintToSigner.set(`hint:${hint}`, signer.key);
-      }
-      const matched = signatures.value.map((signature) => ({
-        signer: hintToSigner.get(signature.signer) ?? signature.signer,
-      }));
+      // Ambiguous hints are reported so the arithmetic can say "unknown"
+      // instead of attributing weight to the wrong key.
+      const matched = matchEnvelopeSignatures(signatures.value, account.value.signers);
 
       const state = evaluateApprovalState({
         signers: account.value.signers,
         thresholds: account.value.thresholds,
-        signatures: matched,
+        signatures: matched.signatures,
+        signatureDataComplete: matched.ambiguousHints.length === 0,
       });
       const unmatched = unmatchedSignatures(signatures.value, account.value.signers);
 
@@ -131,7 +129,7 @@ export function MultisigTracker() {
       announce(
         state.ready
           ? "Multisig envelope has enough signatures to submit"
-          : `Multisig envelope pending: ${state.collectedWeight} of ${state.requiredWeight} weight collected`,
+          : `Multisig envelope pending: ${state.collectedWeight} of ${state.requiredWeight} weight collected. ${remainingWeightSummary(state)}`,
       );
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
@@ -220,6 +218,47 @@ export function MultisigTracker() {
               <button className="secondary" onClick={() => void doCopy("xdr")}>
                 {copied === "xdr" ? "Copied" : "Copy envelope XDR"}
               </button>
+            </div>
+          )}
+
+          <div className="notice" style={{ marginTop: 10 }}>
+            <strong>Remaining signer weight</strong>
+            <span className="tiny">{remainingWeightSummary(report.state)}</span>
+            <ul className="tiny" style={{ margin: "6px 0 0", paddingLeft: 18 }}>
+              {report.state.thresholds.map((threshold) => (
+                <li key={threshold.level}>
+                  {THRESHOLD_LABELS[threshold.level]} ({threshold.requiredWeight}):{" "}
+                  {threshold.remainingWeight === null
+                    ? "unknown — signer data could not be fully matched"
+                    : threshold.remainingWeight === 0
+                      ? "met"
+                      : `${threshold.remainingWeight} more weight required`}{" "}
+                  <span className="muted">
+                    (collected {threshold.collectedWeight} of {threshold.requiredWeight})
+                  </span>
+                </li>
+              ))}
+            </ul>
+            {report.state.coverage === "unknown" && (
+              <span className="tiny muted">
+                This account has signers whose signatures cannot be identified from an envelope
+                (hash, pre-auth, signed-payload or ambiguous-hint signers). Their signatures still
+                count on the network, so the remaining weight is a lower bound, not an exact figure.
+                Re-check after those co-signers report back.
+              </span>
+            )}
+          </div>
+
+          {report.state.duplicateSignatures.length > 0 && (
+            <div className="notice" style={{ marginTop: 10 }}>
+              <strong>
+                {report.state.duplicateSignatures.length} signer(s) signed the envelope more than
+                once
+              </strong>
+              <span className="tiny">
+                Repeated signatures are counted once, exactly as the network counts them, so they do
+                not inflate the collected weight.
+              </span>
             </div>
           )}
 

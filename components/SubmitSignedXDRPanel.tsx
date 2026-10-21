@@ -6,6 +6,7 @@ import { ErrorBlock, OutcomeList, starLink } from "./bits.tsx";
 import { TransactionBuilder } from "@stellar/stellar-sdk";
 import { NETWORK } from "../lib/guard/network.ts";
 import { announce } from "../lib/guard/useAnnounce.ts";
+import { usePwaActivity } from "../lib/guard/usePwaActivity.ts";
 
 export function SubmitSignedXDRPanel() {
   const { server } = useGuard();
@@ -13,6 +14,8 @@ export function SubmitSignedXDRPanel() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [successHash, setSuccessHash] = useState<string | null>(null);
+  // A pending write is work an app-shell update must not interrupt (#398).
+  usePwaActivity(busy, "write");
 
   async function submit() {
     setBusy(true);
